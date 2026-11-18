@@ -1,0 +1,577 @@
+"""
+Monthly Leave Management (Settings → Leave Management).
+
+Covers set_monthly_credit() (difference-only application, edits, zero,
+idempotent re-apply, validation, history kept), the dashboard cache drop,
+import preview/confirm (templates, errors, duplicates, re-import, partial
+failure, concurrency lock), manual entry, permissions and branch scope,
+and that annual/opening/used/carry-forward values are untouched.
+"""
+from __future__ import annotations
+
+import csv
+import io
+import threading
+from decimal import Decimal
+
+from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection, connections
+from django.test import TestCase, TransactionTestCase
+from django.urls import reverse
+from rest_framework.test import APIClient
+
+from apps.accounts.models import AuditLog
+from apps.hrms.models import CREDIT_TXN_MONTHLY, LeaveBalance, LeaveCreditTransaction
+from apps.hrms.services_leave_credit import (
+    LeaveCreditError, monthly_credit_value, reverse_transaction, set_monthly_credit, yearly_summary,
+)
+from apps.hrms.tests_leave_credits import PASSWORD, YEAR, _Fixtures, _key
+from config.test_runner import TEST_COMPANY_CODE
+
+MONTH = 3
+
+
+def _csv(rows, header=('Employee Code', 'Leave Type', 'Monthly Leave Credit'), name='monthly.csv'):
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(header)
+    writer.writerows(rows)
+    return SimpleUploadedFile(name, buf.getvalue().encode('utf-8'), content_type='text/csv')
+
+
+def _xlsx(rows):
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(['Employee Code', 'Leave Type', 'Monthly Leave Credit'])
+    for r in rows:
+        ws.append(list(r))
+    buf = io.BytesIO()
+    wb.save(buf)
+    return SimpleUploadedFile('monthly.xlsx', buf.getvalue(),
+                              content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
+class MonthlyCreditServiceTests(_Fixtures, TestCase):
+    def setUp(self):
+        self.make_fixtures()
+
+    def set(self, value, **kw):
+        kw.setdefault('employee', self.employee)
+        kw.setdefault('leave_type', 'casual')
+        kw.setdefault('year', YEAR)
+        kw.setdefault('month', MONTH)
+        kw.setdefault('actor', self.hr_hyd)
+        return set_monthly_credit(value=value, **kw)
+
+    def total(self):
+        self.balance.refresh_from_db()
+        return self.balance.total_days
+
+    def test_add_edit_reapply_and_zero(self):
+        self.assertEqual(self.set('1.5')['status'], 'created')
+        self.assertEqual(self.total(), Decimal('13.5'))
+
+        result = self.set('2')
+        self.assertEqual((result['status'], result['delta']), ('updated', Decimal('0.5')))
+        self.assertEqual(self.total(), Decimal('14'))
+
+        self.assertEqual(self.set('2')['status'], 'unchanged')   # same value: no change, no row
+        self.assertEqual(self.total(), Decimal('14'))
+
+        self.assertEqual(self.set('0')['delta'], Decimal('-2'))  # 0 reverses the month's credit
+        self.assertEqual(self.total(), Decimal('12'))
+        self.assertEqual(monthly_credit_value(self.employee, 'casual', YEAR, MONTH), Decimal('0'))
+        # history is append-only: three monthly rows remain (+1.5, +0.5, -2)
+        rows = LeaveCreditTransaction.objects.filter(txn_type=CREDIT_TXN_MONTHLY).order_by('created_at')
+        self.assertEqual([r.amount for r in rows], [Decimal('1.5'), Decimal('0.5'), Decimal('-2')])
+        self.assertTrue(all(r.month == MONTH for r in rows))
+        self.assertEqual(AuditLog.objects.filter(action='leave_monthly_credit_set').count(), 3)
+
+    def test_months_and_leave_types_are_independent(self):
+        self.set('1')
+        self.set('2', month=MONTH + 1)
+        self.assertEqual(monthly_credit_value(self.employee, 'casual', YEAR, MONTH), Decimal('1'))
+        self.assertEqual(monthly_credit_value(self.employee, 'casual', YEAR, MONTH + 1), Decimal('2'))
+        self.assertEqual(self.total(), Decimal('15'))
+
+    def test_only_total_days_changes(self):
+        self.set('3')
+        self.balance.refresh_from_db()
+        self.assertEqual((self.balance.used_days, self.balance.carried_forward), (Decimal('2'), Decimal('1')))
+        self.assertEqual(self.casual.__class__.objects.get(pk=self.casual.pk).annual_days, Decimal('12'))
+        other = LeaveBalance.objects.filter(employee=self.other_hyd).count()
+        self.assertEqual(other, 0)
+
+    def test_creates_current_year_balance_when_missing(self):
+        result = self.set('1', employee=self.other_hyd)
+        self.assertEqual(result['status'], 'created')
+        self.assertEqual(LeaveBalance.objects.get(employee=self.other_hyd, leave_type='casual', year=YEAR).total_days, Decimal('1'))
+        # zero for an employee with no balance creates nothing
+        self.assertEqual(self.set('0', employee=self.emp_mum)['status'], 'unchanged')
+        self.assertFalse(LeaveBalance.objects.filter(employee=self.emp_mum).exists())
+
+    def test_validation(self):
+        for bad in ('-1', '1.25', 'abc', '32'):
+            with self.subTest(bad=bad), self.assertRaises(LeaveCreditError):
+                self.set(bad)
+        for month in (0, 13, 'x'):
+            with self.subTest(month=month), self.assertRaises(LeaveCreditError):
+                self.set('1', month=month)
+        with self.assertRaises(LeaveCreditError):
+            self.set('1', leave_type='lwp')
+        with self.assertRaises(LeaveCreditError):
+            self.set('1', year=YEAR + 1)
+        self.employee.is_active = False
+        self.employee.save(update_fields=['is_active'])
+        with self.assertRaises(LeaveCreditError):
+            self.set('1')
+        self.assertEqual(self.total(), Decimal('12'))
+
+    def test_reduction_cannot_go_below_used(self):
+        self.set('5')
+        self.balance.used_days = Decimal('16')
+        self.balance.save(update_fields=['used_days'])
+        with self.assertRaises(LeaveCreditError):
+            self.set('0')
+        self.assertEqual(self.total(), Decimal('17'))
+
+    def test_monthly_rows_cannot_be_reversed_from_leave_credits(self):
+        txn = self.set('1')['transaction']
+        with self.assertRaises(LeaveCreditError):
+            reverse_transaction(employee=self.employee, txn_id=txn.id, reason='x', actor=self.hr_hyd, idempotency_key=_key())
+
+    def test_yearly_summary_still_reconciles(self):
+        self.set('2')
+        row = next(r for r in yearly_summary(self.employee, YEAR) if r['leave_type'] == 'casual')
+        self.assertEqual(row['opening_or_allocated'] + row['carried_forward'] + row['manual_adjustments'], row['total_credits'])
+
+    def test_dashboard_balance_cache_dropped_after_commit(self):
+        key = f'dashboard:employee:leave_balance:{self.employee.id}:{YEAR}'
+        cache.set(key, {'stale': True}, 300)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.set('1')
+        self.assertIsNone(cache.get(key))
+
+
+class MonthlyLeaveApiTests(_Fixtures, TestCase):
+    def setUp(self):
+        self.make_fixtures()
+        self.client = APIClient()
+
+    def _login(self, user):
+        resp = self.client.post(reverse('login'), {'company_code': TEST_COMPANY_CODE, 'email': user.email,
+                                                   'password': PASSWORD}, format='json')
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+    def _import(self, upload, dry_run=False, **extra):
+        data = {'file': upload, 'year': YEAR, 'month': MONTH, **extra}
+        if dry_run:
+            data['dry_run'] = 'true'
+        return self.client.post(reverse('leave-monthly-import'), data, format='multipart')
+
+    # ── templates ──
+    def test_sample_templates(self):
+        self._login(self.hr_hyd)
+        url = reverse('leave-monthly-import-sample')
+        resp = self.client.get(url, {'format': 'csv'})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.content.decode('utf-8-sig').startswith('Employee Code,Leave Type,Monthly Leave Credit'))
+        resp = self.client.get(url, {'format': 'xlsx'})
+        self.assertEqual(resp.status_code, 200)
+        import openpyxl
+        ws = openpyxl.load_workbook(io.BytesIO(resp.content)).active
+        self.assertEqual([c.value for c in ws[1]], ['Employee Code', 'Leave Type', 'Monthly Leave Credit'])
+        self.assertGreater(ws.max_row, 1)
+
+    # ── import ──
+    def test_preview_writes_nothing_and_reports_rows(self):
+        self._login(self.hr_hyd)
+        upload = _csv([
+            ['CREMP01', 'casual', '1.5'],       # new
+            ['CREMP02', 'Casual', '1'],         # new (label match, no balance yet → created on import)
+            ['NOPE01', 'casual', '1'],          # unknown employee
+            ['CREMP03', 'casual', '1'],         # other branch → hidden as not found
+            ['CREMP01', 'bogus', '1'],          # bad leave type
+            ['CREMP02', 'earned', '-1'],        # negative
+            ['CREMP01', 'casual', '2'],         # duplicate of row 2
+        ])
+        resp = self._import(upload, dry_run=True)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        data = resp.data['data']
+        self.assertEqual(data['counts'], {'new': 2, 'update': 0, 'unchanged': 0, 'duplicate': 1, 'error': 4})
+        self.assertIn('was not found', data['rows'][3]['message'])
+        self.assertEqual(data['annual_entitlements'], {'casual': 12.0, 'earned': 15.0})
+        self.assertFalse(LeaveCreditTransaction.objects.exists())
+        self.balance.refresh_from_db()
+        self.assertEqual(self.balance.total_days, Decimal('12'))
+
+    def test_import_partial_failure_and_reimport_is_noop(self):
+        self._login(self.hr_hyd)
+        rows = [['CREMP01', 'casual', '1.5'], ['NOPE01', 'casual', '1'], ['CREMP02', 'casual', '2']]
+        resp = self._import(_csv(rows))
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data['data']['summary'], {'created': 2, 'updated': 0, 'skipped': 0, 'failed': 1, 'total': 3})
+        self.balance.refresh_from_db()
+        self.assertEqual(self.balance.total_days, Decimal('13.5'))
+
+        resp = self._import(_csv(rows))   # same file again: nothing double-credited
+        self.assertEqual(resp.data['data']['summary'], {'created': 0, 'updated': 0, 'skipped': 2, 'failed': 1, 'total': 3})
+        self.balance.refresh_from_db()
+        self.assertEqual(self.balance.total_days, Decimal('13.5'))
+        self.assertEqual(LeaveCreditTransaction.objects.count(), 2)
+
+        resp = self._import(_csv([['CREMP01', 'casual', '0.5']]))   # changed value updates by the difference
+        self.assertEqual(resp.data['data']['summary']['updated'], 1)
+        self.balance.refresh_from_db()
+        self.assertEqual(self.balance.total_days, Decimal('12.5'))
+
+    def test_xlsx_import(self):
+        self._login(self.hr_hyd)
+        resp = self._import(_xlsx([('CREMP01', 'Casual Leave', 2)]))
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data['data']['summary']['created'], 1)
+        self.assertEqual(monthly_credit_value(self.employee, 'casual', YEAR, MONTH), Decimal('2'))
+
+    def test_bad_files_and_inputs(self):
+        self._login(self.hr_hyd)
+        self.assertEqual(self._import(_csv([['CREMP01', 'casual', '1']], header=('Code', 'Type', 'Days'))).status_code, 400)
+        self.assertEqual(self._import(SimpleUploadedFile('x.txt', b'a,b')).status_code, 400)
+        self.assertEqual(self._import(_csv([['CREMP01', 'casual', '1']]), month=13).status_code, 400)
+        self.assertEqual(self._import(_csv([['CREMP01', 'casual', '1']]), year=YEAR + 1).status_code, 400)
+
+    def test_concurrent_import_for_same_month_is_refused(self):
+        self._login(self.hr_hyd)
+        cache.add(f'leave:monthly_import:{YEAR}:{MONTH}', 'someone', 60)
+        resp = self._import(_csv([['CREMP01', 'casual', '1']]))
+        self.assertEqual(resp.status_code, 409)
+        self.assertFalse(LeaveCreditTransaction.objects.exists())
+
+    # ── manual entry ──
+    def test_manual_add_edit_and_lookup(self):
+        self._login(self.hr_hyd)
+        url = reverse('leave-monthly-credits')
+        payload = {'employee_id': 'CREMP01', 'year': YEAR, 'month': MONTH, 'leave_type': 'casual', 'credit': '1'}
+        resp = self.client.post(url, payload, format='json')
+        self.assertEqual((resp.status_code, resp.data['data']['status']), (200, 'created'))
+        resp = self.client.post(url, {**payload, 'credit': '2.5'}, format='json')
+        self.assertEqual((resp.data['data']['status'], resp.data['data']['delta']), ('updated', 1.5))
+        resp = self.client.post(url, {**payload, 'credit': '2.5'}, format='json')
+        self.assertEqual(resp.data['data']['status'], 'unchanged')
+        self.assertEqual(self.client.post(url, {**payload, 'credit': '-1'}, format='json').status_code, 400)
+
+        resp = self.client.get(url, {'employee_id': 'CREMP01', 'year': YEAR, 'month': MONTH})
+        casual = next(r for r in resp.data['data']['leave_types'] if r['leave_type'] == 'casual')
+        self.assertEqual(casual['monthly_credit'], 2.5)
+        self.assertEqual(casual['balance']['total'], 14.5)
+        self.assertEqual(casual['annual_days'], 12.0)
+
+    # ── access ──
+    def test_permissions_and_scope(self):
+        url = reverse('leave-monthly-credits')
+        payload = {'employee_id': 'CREMP03', 'year': YEAR, 'month': MONTH, 'leave_type': 'casual', 'credit': '1'}
+
+        self._login(self.hr_hyd)   # other branch → not found
+        self.assertEqual(self.client.post(url, payload, format='json').status_code, 404)
+        self.assertEqual(self.client.post(url, {**payload, 'employee_id': 'CRHRH01'}, format='json').status_code, 404)  # self
+
+        self._login(self.manager)  # only direct reports
+        self.assertEqual(self.client.post(url, {**payload, 'employee_id': 'CREMP02'}, format='json').status_code, 404)
+        self.assertEqual(self.client.post(url, {**payload, 'employee_id': 'CREMP01'}, format='json').status_code, 200)
+
+        self._login(self.other_hyd)  # no leave.approve
+        self.assertEqual(self.client.post(url, payload, format='json').status_code, 403)
+        self.assertEqual(self._import(_csv([['CREMP01', 'casual', '1']])).status_code, 403)
+        self.assertEqual(self.client.get(reverse('leave-monthly-import-sample')).status_code, 403)
+
+        self._login(self.admin)      # settings.edit → all branches
+        self.assertEqual(self.client.post(url, payload, format='json').status_code, 200)
+        self.assertEqual(LeaveBalance.objects.get(employee=self.emp_mum, leave_type='casual', year=YEAR).total_days, Decimal('1'))
+
+
+class MonthlyLeavePickerScopeTests(_Fixtures, TestCase):
+    """The Manual Entry picker uses GET /employees/?search=; its scope must match
+    the monthly-credit endpoints (Branch Admin → own branch, System Admin → all)."""
+
+    def setUp(self):
+        from apps.accounts.factories import make_role, make_user
+        self.make_fixtures()
+        ba_role = make_role('mlm_branch_admin', permission_codenames=['employees.view', 'leave.approve'])
+        ba_role.can_manage_branch = True
+        ba_role.save(update_fields=['can_manage_branch'])
+        self.branch_admin = make_user('mlm.ba@test.com', role=ba_role, employee_id='CRBA01',
+                                      full_name='Branch Admin Hyd', branch='Hyderabad Credits')
+        self.sys_admin = make_user(
+            'mlm.sa@test.com', role=make_role('mlm_system_admin', permission_codenames=['settings.edit', 'settings.view']),
+            employee_id='CRSA01', full_name='System Admin', branch='Hyderabad Credits',
+        )
+        self.client = APIClient()
+
+    def _login(self, user):
+        resp = self.client.post(reverse('login'), {'company_code': TEST_COMPANY_CODE, 'email': user.email,
+                                                   'password': PASSWORD}, format='json')
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+    def _search(self, q):
+        resp = self.client.get(reverse('employee-list-create'), {'search': q, 'page_size': 50})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        return {r['employee_id'] for r in resp.data['data']['results']}
+
+    def _save(self, code):
+        return self.client.post(reverse('leave-monthly-credits'), {
+            'employee_id': code, 'year': YEAR, 'month': MONTH, 'leave_type': 'casual', 'credit': '1',
+        }, format='json')
+
+    def test_branch_admin_sees_and_saves_only_own_branch(self):
+        self._login(self.branch_admin)
+        found = self._search('CREMP')
+        self.assertIn('CREMP01', found)
+        self.assertIn('CREMP02', found)
+        self.assertNotIn('CREMP03', found)                     # Mumbai employee
+        self.assertEqual(self._search('Mum Emp'), set())        # by name, other branch
+        self.assertEqual(self._search('Other'), {'CREMP02'})    # by name, own branch
+        self.assertEqual(self._save('CREMP01').status_code, 200)
+        self.assertEqual(self._save('CREMP03').status_code, 404)
+        lookup = self.client.get(reverse('leave-monthly-credits'),
+                                 {'employee_id': 'CREMP03', 'year': YEAR, 'month': MONTH})
+        self.assertEqual(lookup.status_code, 404)
+        self.assertFalse(LeaveBalance.objects.filter(employee=self.emp_mum).exists())
+
+    def test_system_admin_sees_and_saves_across_branches(self):
+        self._login(self.sys_admin)
+        self.assertTrue({'CREMP01', 'CREMP02', 'CREMP03'} <= self._search('CREMP'))
+        self.assertEqual(self._search('Mum Emp'), {'CREMP03'})
+        self.assertEqual(self._save('CREMP03').status_code, 200)
+        self.assertEqual(monthly_credit_value(self.emp_mum, 'casual', YEAR, MONTH), Decimal('1'))
+
+    def test_branch_hr_and_manager_scope_unchanged(self):
+        from apps.accounts.factories import make_role
+        self._login(self.hr_hyd)
+        self.assertNotIn('CREMP03', self._search('CREMP'))
+        # The shared fixture's manager role has only leave.approve; the employee
+        # search needs employees.view, as real manager roles have.
+        make_role('credit_manager', permission_codenames=['employees.view'])
+        self._login(self.manager)
+        self.assertEqual(self._search('CREMP'), {'CREMP01'})   # direct reports only
+
+class MonthlyAssignmentsTests(_Fixtures, TestCase):
+    """GET /leave/monthly-credits/assignments/: current values from the ledger, summary, scope, edits."""
+
+    def setUp(self):
+        from apps.accounts.factories import make_role, make_user
+        self.make_fixtures()
+        ba_role = make_role('mla_branch_admin', permission_codenames=['employees.view', 'leave.approve'])
+        ba_role.can_manage_branch = True
+        ba_role.save(update_fields=['can_manage_branch'])
+        self.branch_admin = make_user('mla.ba@test.com', role=ba_role, employee_id='CRBA02',
+                                      full_name='Branch Admin', branch='Hyderabad Credits')
+        self.client = APIClient()
+        # March: employee casual 2 + earned 1, other_hyd casual 1.5, Mumbai employee casual 3
+        for emp, lt, value in ((self.employee, 'casual', '2'), (self.employee, 'earned', '1'),
+                               (self.other_hyd, 'casual', '1.5'), (self.emp_mum, 'casual', '3')):
+            set_monthly_credit(employee=emp, leave_type=lt, year=YEAR, month=MONTH, value=value, actor=self.admin)
+        set_monthly_credit(employee=self.employee, leave_type='casual', year=YEAR, month=MONTH + 1, value='5', actor=self.admin)
+
+    def _login(self, user):
+        resp = self.client.post(reverse('login'), {'company_code': TEST_COMPANY_CODE, 'email': user.email,
+                                                   'password': PASSWORD}, format='json')
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+    def _list(self, month=MONTH):
+        resp = self.client.get(reverse('leave-monthly-assignments'), {'year': YEAR, 'month': month})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        return resp.data['data']
+
+    def test_system_admin_sees_all_branches_with_summary(self):
+        self._login(self.admin)
+        data = self._list()
+        rows = {(r['employee_id'], r['leave_type']): r for r in data['assignments']}
+        self.assertEqual(set(rows), {('CREMP01', 'casual'), ('CREMP01', 'earned'), ('CREMP02', 'casual'), ('CREMP03', 'casual')})
+        r = rows[('CREMP01', 'casual')]
+        self.assertEqual((r['employee_name'], r['branch'], r['credit'], r['month'], r['year']),
+                         ('Employee', 'Hyderabad Credits', 2.0, MONTH, YEAR))
+        self.assertTrue(r['last_updated'])
+        self.assertEqual(data['summary'], {'employees': 3, 'entries': 4, 'total_days': 7.5})
+        self.assertEqual(self._list(MONTH + 1)['summary'], {'employees': 1, 'entries': 1, 'total_days': 5.0})
+
+    def test_branch_admin_sees_own_branch_only(self):
+        self._login(self.branch_admin)
+        data = self._list()
+        self.assertEqual({r['employee_id'] for r in data['assignments']}, {'CREMP01', 'CREMP02'})
+        self.assertEqual(data['summary'], {'employees': 2, 'entries': 3, 'total_days': 4.5})
+
+    def test_manager_sees_direct_reports_and_others_are_refused(self):
+        self._login(self.manager)
+        self.assertEqual({r['employee_id'] for r in self._list()['assignments']}, {'CREMP01'})
+        self._login(self.other_hyd)
+        self.assertEqual(self.client.get(reverse('leave-monthly-assignments'), {'year': YEAR, 'month': MONTH}).status_code, 403)
+
+    def test_edit_updates_list_and_balance_by_difference(self):
+        self._login(self.branch_admin)
+        url = reverse('leave-monthly-credits')
+        payload = {'employee_id': 'CREMP01', 'leave_type': 'casual', 'year': YEAR, 'month': MONTH}
+        before = LeaveBalance.objects.get(employee=self.employee, leave_type='casual', year=YEAR).total_days
+
+        self.assertEqual(self.client.post(url, {**payload, 'credit': '3'}, format='json').data['data']['delta'], 1.0)
+        self.assertEqual(self.client.post(url, {**payload, 'credit': '1'}, format='json').data['data']['delta'], -2.0)
+        balance = LeaveBalance.objects.get(employee=self.employee, leave_type='casual', year=YEAR)
+        self.assertEqual(balance.total_days, before - Decimal('1'))
+        self.assertEqual(balance.used_days, Decimal('2'))   # never touched
+        row = next(r for r in self._list()['assignments'] if (r['employee_id'], r['leave_type']) == ('CREMP01', 'casual'))
+        self.assertEqual(row['credit'], 1.0)
+
+        self.client.post(url, {**payload, 'credit': '0'}, format='json')   # zero removes it from the list
+        ids = {(r['employee_id'], r['leave_type']) for r in self._list()['assignments']}
+        self.assertNotIn(('CREMP01', 'casual'), ids)
+        self.assertEqual(LeaveCreditTransaction.objects.filter(employee=self.employee, leave_type='casual',
+                                                               month=MONTH).count(), 4)   # history kept
+
+    def test_reduction_below_used_is_refused_and_list_unchanged(self):
+        balance = LeaveBalance.objects.get(employee=self.employee, leave_type='casual', year=YEAR)
+        balance.used_days = balance.total_days
+        balance.save(update_fields=['used_days'])
+        self._login(self.admin)
+        resp = self.client.post(reverse('leave-monthly-credits'), {
+            'employee_id': 'CREMP01', 'leave_type': 'casual', 'year': YEAR, 'month': MONTH, 'credit': '0',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+        row = next(r for r in self._list()['assignments'] if (r['employee_id'], r['leave_type']) == ('CREMP01', 'casual'))
+        self.assertEqual(row['credit'], 2.0)
+
+    def test_invalid_filters(self):
+        self._login(self.admin)
+        url = reverse('leave-monthly-assignments')
+        self.assertEqual(self.client.get(url, {'year': YEAR, 'month': 13}).status_code, 400)
+        self.assertEqual(self.client.get(url, {'year': YEAR + 1, 'month': 1}).status_code, 400)
+
+class MonthlyBulkEntryTests(_Fixtures, TestCase):
+    """POST /leave/monthly-credits/bulk/: one credit for several employees, each revalidated and saved separately."""
+
+    def setUp(self):
+        from apps.accounts.factories import make_role, make_user
+        self.make_fixtures()
+        ba_role = make_role('mlb_branch_admin', permission_codenames=['employees.view', 'leave.approve'])
+        ba_role.can_manage_branch = True
+        ba_role.save(update_fields=['can_manage_branch'])
+        self.branch_admin = make_user('mlb.ba@test.com', role=ba_role, employee_id='CRBA03',
+                                      full_name='Branch Admin', branch='Hyderabad Credits')
+        self.client = APIClient()
+
+    def _login(self, user):
+        resp = self.client.post(reverse('login'), {'company_code': TEST_COMPANY_CODE, 'email': user.email,
+                                                   'password': PASSWORD}, format='json')
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+    def _bulk(self, codes, credit='2', dry_run=False, leave_type='casual'):
+        payload = {'employee_ids': codes, 'leave_type': leave_type, 'year': YEAR, 'month': MONTH, 'credit': credit}
+        if dry_run:
+            payload['dry_run'] = True
+        return self.client.post(reverse('leave-monthly-bulk'), payload, format='json')
+
+    def test_review_revalidates_every_employee_and_writes_nothing(self):
+        self._login(self.branch_admin)
+        resp = self._bulk(['CREMP01', 'CREMP02', 'CREMP03', 'CREMP01', 'CRBA03', 'NOPE'], dry_run=True)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        data = resp.data['data']
+        self.assertEqual(data['counts'], {'new': 2, 'update': 0, 'unchanged': 0, 'duplicate': 1, 'error': 3})
+        by_code = {}
+        for r in data['rows']:
+            by_code.setdefault(r['employee_code'], r)
+        self.assertIn('not found', by_code['CREMP03']['message'])           # other branch, hidden
+        self.assertIn('your own leave credits', by_code['CRBA03']['message'])
+        self.assertFalse(LeaveCreditTransaction.objects.exists())
+
+    def test_confirm_saves_each_employee_with_history_and_retry_is_noop(self):
+        self._login(self.branch_admin)
+        resp = self._bulk(['CREMP01', 'CREMP02'])
+        self.assertEqual(resp.data['data']['summary'], {'created': 2, 'updated': 0, 'skipped': 0, 'failed': 0, 'total': 2})
+        self.balance.refresh_from_db()
+        self.assertEqual(self.balance.total_days, Decimal('14'))
+        self.assertEqual(LeaveBalance.objects.get(employee=self.other_hyd, leave_type='casual', year=YEAR).total_days, Decimal('2'))
+        txns = LeaveCreditTransaction.objects.filter(txn_type=CREDIT_TXN_MONTHLY)
+        self.assertEqual(txns.count(), 2)
+        self.assertTrue(all('imported' not in t.reason for t in txns))
+        self.assertTrue(all(t.created_by_id == self.branch_admin.id for t in txns))
+        self.assertEqual(AuditLog.objects.filter(action='leave_monthly_credit_set').count(), 2)
+
+        resp = self._bulk(['CREMP01', 'CREMP02'])          # retried: nothing applied twice
+        self.assertEqual(resp.data['data']['summary']['skipped'], 2)
+        self.balance.refresh_from_db()
+        self.assertEqual(self.balance.total_days, Decimal('14'))
+        self.assertEqual(LeaveCreditTransaction.objects.count(), 2)
+
+    def test_partial_failure_keeps_other_employees_updates(self):
+        self._login(self.admin)
+        self._bulk(['CREMP01', 'CREMP02'], credit='3')
+        other = LeaveBalance.objects.get(employee=self.other_hyd, leave_type='casual', year=YEAR)
+        other.used_days = Decimal('3')
+        other.save(update_fields=['used_days'])
+
+        resp = self._bulk(['CREMP01', 'CREMP02'], credit='0')   # CREMP02 would drop below used
+        summary = resp.data['data']['summary']
+        self.assertEqual((summary['updated'], summary['failed']), (1, 1))
+        failed = next(r for r in resp.data['data']['rows'] if r['employee_code'] == 'CREMP02')
+        self.assertIn('below', failed['message'])
+        self.assertEqual(monthly_credit_value(self.employee, 'casual', YEAR, MONTH), Decimal('0'))
+        self.assertEqual(monthly_credit_value(self.other_hyd, 'casual', YEAR, MONTH), Decimal('3'))
+
+    def test_system_admin_across_branches(self):
+        self._login(self.admin)
+        resp = self._bulk(['CREMP01', 'CREMP03'], credit='1')
+        self.assertEqual(resp.data['data']['summary']['created'], 2)
+        self.assertEqual(monthly_credit_value(self.emp_mum, 'casual', YEAR, MONTH), Decimal('1'))
+
+    def test_validation_and_permissions(self):
+        self._login(self.admin)
+        self.assertEqual(self._bulk([]).status_code, 400)
+        self.assertEqual(self._bulk(['CREMP01'] * 501).status_code, 400)
+        self.assertEqual(self._bulk(['CREMP01'], credit='-1', dry_run=True).data['data']['counts']['error'], 1)
+        self.assertEqual(self._bulk(['CREMP01'], leave_type='lwp', dry_run=True).data['data']['counts']['error'], 1)
+        self._login(self.other_hyd)   # no leave.approve
+        self.assertEqual(self._bulk(['CREMP01']).status_code, 403)
+        self.assertFalse(LeaveCreditTransaction.objects.exists())
+
+    def test_dashboard_cache_dropped_for_each_saved_employee(self):
+        keys = [f'dashboard:employee:leave_balance:{e.id}:{YEAR}' for e in (self.employee, self.other_hyd)]
+        for k in keys:
+            cache.set(k, {'stale': True}, 300)
+        self._login(self.admin)
+        with self.captureOnCommitCallbacks(execute=True):
+            self._bulk(['CREMP01', 'CREMP02'])
+        self.assertEqual([cache.get(k) for k in keys], [None, None])
+
+class MonthlyCreditConcurrencyTests(_Fixtures, TransactionTestCase):
+    """Real commits and separate connections: concurrent saves of the same month apply once."""
+
+    def setUp(self):
+        self.make_fixtures()
+
+    def tearDown(self):
+        for conn in connections.all():
+            conn.close()
+
+    def test_concurrent_same_value_applies_once(self):
+        results = []
+
+        def run():
+            from apps.tenants.models import Client
+            connection.set_tenant(Client.objects.get(company_code=TEST_COMPANY_CODE))
+            try:
+                results.append(set_monthly_credit(employee=self.employee, leave_type='casual', year=YEAR,
+                                                  month=MONTH, value='2', actor=self.hr_hyd)['status'])
+            except Exception as exc:  # noqa: BLE001 — asserted below
+                results.append(exc)
+            finally:
+                connections.close_all()
+
+        threads = [threading.Thread(target=run) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertFalse([r for r in results if isinstance(r, Exception)], results)
+        self.assertEqual(sorted(results), ['created'] + ['unchanged'] * 4)
+        self.balance.refresh_from_db()
+        self.assertEqual(self.balance.total_days, Decimal('14'))
+        self.assertEqual(LeaveCreditTransaction.objects.count(), 1)

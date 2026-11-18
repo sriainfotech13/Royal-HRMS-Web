@@ -1,0 +1,103 @@
+"use client";
+
+import { useState } from "react";
+import ClockInButton         from "@/components/ClockInButton";
+import KpiConsole            from "@/components/dashboard/KpiConsole";
+import HrAttendanceCard      from "@/components/dashboard/hr/HrAttendanceCard";
+import AnnouncementCard      from "@/components/dashboard/AnnouncementCard";
+import PendingApprovalsWidget from "@/components/dashboard/PendingApprovalsWidget";
+import DeptHeadcountChart    from "@/components/dashboard/DeptHeadcountChart";
+import EmployeeLifecycleTabs from "@/components/dashboard/EmployeeLifecycleTabs";
+import BirthdayWidget        from "@/components/dashboard/BirthdayWidget";
+import AuditLogsWidget       from "@/components/dashboard/AuditLogsWidget";
+import HrActionQueue         from "@/components/dashboard/hr/HrActionQueue";
+import type { SessionPayload } from "@/lib/session";
+import { hasModule, moduleForHref } from "@/lib/modules";
+
+interface Props { session: SessionPayload }
+
+interface QuickAction {
+  href:  string;
+  icon:  string;
+  bg:    string;
+  color: string;
+  label: string;
+}
+
+const QUICK_ACTIONS: QuickAction[] = [
+  { href: "/dashboard/employees",            icon: "ti-id-badge",            bg: "rgba(30,78,140,0.12)",  color: "var(--primary)", label: "Employees"     },
+  { href: "/dashboard/settings/permissions", icon: "ti-shield-check",        bg: "rgba(27,138,107,0.12)", color: "var(--success)", label: "Roles & Perms" },
+  { href: "/dashboard/attendance",           icon: "ti-clock",               bg: "rgba(14,124,134,0.12)", color: "var(--info)",    label: "Attendance"    },
+  { href: "/dashboard/payroll",              icon: "ti-report-money",        bg: "rgba(181,101,29,0.12)", color: "var(--warn)",    label: "Payroll"       },
+  { href: "/dashboard/branches",             icon: "ti-building-skyscraper", bg: "rgba(30,78,140,0.12)",  color: "var(--primary)", label: "Branches"      },
+  { href: "/dashboard/settings",             icon: "ti-settings",            bg: "rgba(181,101,29,0.12)", color: "var(--warn)",    label: "Settings"      },
+];
+
+export default function AdminDashboard({ session }: Props) {
+  const firstName = session.name.split(" ")[0];
+  // Bumped after the user's own Clock In/Out so "My Attendance Today" re-reads.
+  const [attendanceKey, setAttendanceKey] = useState(0);
+
+  return (
+    <>
+      {/* KPI Console — welcome + health pills + live stats, plus the signed-in
+          user's own Clock In/Out (the same control the HR / manager consoles use). */}
+      <KpiConsole
+        firstName={firstName}
+        actions={hasModule(session.modules, "attendance") ? <ClockInButton onPunchSuccess={() => setAttendanceKey(k => k + 1)} /> : undefined}
+      />
+
+      {/* Announcement */}
+      {hasModule(session.modules, "announcements") && <AnnouncementCard />}
+
+      {/* Quick Actions */}
+      <div className="card mb-20">
+        <div className="card-header">
+          <div className="card-title"><i className="ti ti-bolt" /> Quick Actions</div>
+        </div>
+        <div className="card-body">
+          <div className="qa-grid">
+            {QUICK_ACTIONS.filter(a => hasModule(session.modules, moduleForHref(a.href))).map(a => (
+              <a key={a.href} href={a.href} className="qa-tile">
+                <div className="qa-icon" style={{ background: a.bg, color: a.color }}>
+                  <i className={`ti ${a.icon}`} />
+                </div>
+                <span className="qa-label">{a.label}</span>
+              </a>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Row 3 — Pending Approvals + Headcount | Announcement + Lifecycle */}
+      {/* alignItems: "start" — the left column stacks two cards and the
+          right column only one; CSS Grid's default `stretch` was forcing
+          the right column's wrapper to match the taller left column's
+          height, leaving a large blank gap below EmployeeLifecycleTabs
+          before Row 4 began. Same fix already applied the same way on
+          app/dashboard/face-id-registrations/page.tsx's own grid-2. */}
+      <div className="grid-2 mb-20" style={{ alignItems: "start" }}>
+        <div>
+          <PendingApprovalsWidget />
+          {/* Branch Admin: its own branch's Action Queue (counts scoped by the API). */}
+          {session.can_manage_branch && <div className="mb-20"><HrActionQueue /></div>}
+          <DeptHeadcountChart />
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {hasModule(session.modules, "attendance") && <HrAttendanceCard refreshKey={attendanceKey} />}
+          <EmployeeLifecycleTabs />
+        </div>
+      </div>
+
+      {/* Row 4 — Birthdays | Audit Logs */}
+      <div className="grid-2" style={{ alignItems: "start" }}>
+        <div>
+          <BirthdayWidget />
+        </div>
+        <div>
+          <AuditLogsWidget />
+        </div>
+      </div>
+    </>
+  );
+}

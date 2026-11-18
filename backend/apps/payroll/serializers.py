@@ -1,0 +1,608 @@
+from rest_framework import serializers
+from .models import (
+    PayrollSettings,
+    StatutoryConfig,
+    SalaryStructure,
+    SalaryComponent,
+    BranchPayrollConfig,
+    EmployeeSalaryConfig,
+    EmployeeSalaryComponent,
+    PayrollCycle,
+    ManagerAttendanceApproval,
+    EmployeePayslip,
+    PayslipQuery,
+    PayrollAdjustment,
+    PAYSLIP_TEMPLATE_STANDARD,
+)
+
+MAX_FIXED_DEDUCTION_ROWS = 15
+MAX_FIXED_DEDUCTION_LABEL = 40
+
+
+def mask_statutory_number(value: str, show: bool, mask: bool) -> str | None:
+    """UAN / ESIC number as the payslip shows it: None when hidden, the
+    last 4 characters with the rest starred when masked, else in full."""
+    value = (value or '').strip()
+    if not show or not value:
+        return None
+    if mask:
+        return '*' * max(0, len(value) - 4) + value[-4:]
+    return value
+
+
+def signed_file_url(field_file) -> str | None:
+    # AuthenticatedRawMediaCloudinaryStorage.url() is a short-lived signed URL.
+    if not field_file:
+        return None
+    try:
+        return field_file.url
+    except Exception:
+        return None
+
+
+class PayrollSettingsSerializer(serializers.ModelSerializer):
+    payslip_stamp_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PayrollSettings
+        fields = [
+            'id',
+            'cycle_start_day',
+            'cycle_end_day',
+            'pay_day',
+            'approval_levels',
+            'employee_query_window_hours',
+            'enable_reimbursements',
+            'enable_bonuses',
+            'eps_rate',
+            'edli_rate',
+            'edli_wage_ceiling',
+            'epf_admin_rate',
+            'payslip_template',
+            'show_uan',
+            'mask_uan',
+            'show_esic',
+            'mask_esic',
+            'fixed_deduction_rows',
+            'payslip_stamp_url',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'payslip_stamp_url', 'created_at', 'updated_at']
+
+    def get_payslip_stamp_url(self, obj):
+        return signed_file_url(obj.payslip_stamp)
+
+    def validate_fixed_deduction_rows(self, value):
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise serializers.ValidationError('Fixed deduction rows must be a list of labels.')
+        labels = [' '.join(v.split()) for v in value if v.strip()]
+        if len(labels) > MAX_FIXED_DEDUCTION_ROWS:
+            raise serializers.ValidationError(f'At most {MAX_FIXED_DEDUCTION_ROWS} fixed deduction rows.')
+        if any(len(v) > MAX_FIXED_DEDUCTION_LABEL for v in labels):
+            raise serializers.ValidationError(f'Each label must be at most {MAX_FIXED_DEDUCTION_LABEL} characters.')
+        if len({v.lower() for v in labels}) != len(labels):
+            raise serializers.ValidationError('Each fixed deduction row may appear only once.')
+        return labels
+
+    def validate_eps_rate(self, value):
+        if value is not None and not (0 < value <= 100):
+            raise serializers.ValidationError('EPS rate must be between 0.01 and 100.')
+        return value
+
+    def validate_edli_rate(self, value):
+        if value is not None and not (0 < value <= 100):
+            raise serializers.ValidationError('EDLI rate must be between 0.01 and 100.')
+        return value
+
+    def validate_epf_admin_rate(self, value):
+        if value is not None and not (0 <= value <= 100):
+            raise serializers.ValidationError('EPF admin rate must be between 0 and 100.')
+        return value
+
+    def validate_edli_wage_ceiling(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError('EDLI wage ceiling must be greater than 0.')
+        return value
+
+    def validate(self, data):
+        start = data.get('cycle_start_day', getattr(self.instance, 'cycle_start_day', None))
+        end = data.get('cycle_end_day', getattr(self.instance, 'cycle_end_day', None))
+        pay = data.get('pay_day', getattr(self.instance, 'pay_day', None))
+        for field, val in [('cycle_start_day', start), ('cycle_end_day', end), ('pay_day', pay)]:
+            if val is not None and not (1 <= val <= 31):
+                raise serializers.ValidationError({field: 'Must be between 1 and 31.'})
+        return data
+
+
+class StatutoryConfigSerializer(serializers.ModelSerializer):
+    state_name = serializers.CharField(source='state.name', read_only=True)
+    state_code = serializers.CharField(source='state.code', read_only=True)
+
+    class Meta:
+        model = StatutoryConfig
+        fields = [
+            'id',
+            'state',
+            'state_name',
+            'state_code',
+            'pt_applicable',
+            'pt_slabs',
+            'esi_applicable',
+            'esi_wage_ceiling',
+            'esi_employee_rate',
+            'esi_employer_rate',
+            'esi_daily_wage_exemption_threshold',
+            'lwf_applicable',
+            'lwf_employee_amount',
+            'lwf_employer_amount',
+            'lwf_frequency',
+            'lwf_due_months',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'state_name', 'state_code', 'created_at', 'updated_at']
+
+    def validate_lwf_due_months(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError('lwf_due_months must be a list of month numbers.')
+        for month in value:
+            if not isinstance(month, int) or isinstance(month, bool) or not (1 <= month <= 12):
+                raise serializers.ValidationError('Each due month must be an integer between 1 and 12.')
+        if len(set(value)) != len(value):
+            raise serializers.ValidationError('Due months must not contain duplicates.')
+        return value
+
+    def validate(self, data):
+        frequency = data.get('lwf_frequency', getattr(self.instance, 'lwf_frequency', StatutoryConfig.LWF_MONTHLY))
+        due_months = data.get('lwf_due_months', getattr(self.instance, 'lwf_due_months', None) or [])
+        if frequency == StatutoryConfig.LWF_ANNUAL and len(due_months) != 1:
+            raise serializers.ValidationError({
+                'lwf_due_months': 'Annual LWF requires exactly one due month.',
+            })
+        if frequency == StatutoryConfig.LWF_HALFYEARLY and len(set(due_months)) != 2:
+            raise serializers.ValidationError({
+                'lwf_due_months': 'Half-yearly LWF requires exactly two distinct due months.',
+            })
+        return data
+
+
+class SalaryComponentSerializer(serializers.ModelSerializer):
+    role = serializers.ChoiceField(choices=SalaryComponent.ROLE_CHOICES, required=False)
+
+    class Meta:
+        model = SalaryComponent
+        fields = [
+            'id',
+            'name',
+            'component_type',
+            'calculation_type',
+            'role',
+            'value',
+            'is_taxable',
+            'is_active',
+            'order',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def create(self, validated_data):
+        # Callers that don't send a role get the one payroll has always
+        # derived from the name ("Basic", "HRA", "Special Allowance").
+        if 'role' not in validated_data:
+            from apps.payroll.services_salary_components import role_for_name
+            validated_data['role'] = role_for_name(validated_data.get('name', ''))
+        return super().create(validated_data)
+
+
+class SalaryStructureSerializer(serializers.ModelSerializer):
+    components = SalaryComponentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = SalaryStructure
+        fields = [
+            'id',
+            'name',
+            'description',
+            'is_default',
+            'is_active',
+            'components',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class SalaryStructureListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for list views — no nested components."""
+
+    class Meta:
+        model = SalaryStructure
+        fields = ['id', 'name', 'description', 'is_default', 'is_active', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class BranchPayrollConfigSerializer(serializers.ModelSerializer):
+    branch_name = serializers.CharField(source='branch.branch_name', read_only=True)
+    branch_state = serializers.CharField(source='branch.state.name', read_only=True)
+    structure_name = serializers.CharField(source='salary_structure.name', read_only=True)
+
+    class Meta:
+        model = BranchPayrollConfig
+        fields = [
+            'id',
+            'branch',
+            'branch_name',
+            'branch_state',
+            'salary_structure',
+            'structure_name',
+            'pf_applicable',
+            'pf_employee_rate',
+            'pf_employer_rate',
+            'pf_wage_ceiling',
+            'payslip_template',
+            'principal_employer_name',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'branch_name', 'branch_state', 'structure_name', 'created_at', 'updated_at']
+
+    def validate_principal_employer_name(self, value):
+        return ' '.join((value or '').split())
+
+
+class EmployeeSalaryComponentSerializer(serializers.ModelSerializer):
+    """Read-only — one component of one salary revision (the saved snapshot)."""
+    annual_amount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EmployeeSalaryComponent
+        fields = [
+            'id', 'source_component', 'name', 'component_type', 'calculation_type', 'role', 'value',
+            'monthly_amount', 'annual_amount', 'is_taxable', 'is_enabled', 'order',
+        ]
+        read_only_fields = fields
+
+    def get_annual_amount(self, obj):
+        return str(obj.monthly_amount * 12)
+
+
+class EmployeeSalaryConfigSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.full_name', read_only=True)
+    employee_id_code = serializers.CharField(source='employee.employee_id', read_only=True)
+    structure_name = serializers.CharField(source='salary_structure.name', read_only=True)
+    monthly_ctc = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    template_structure_name = serializers.CharField(source='template_structure.name', read_only=True, default=None)
+    created_by_name = serializers.CharField(source='created_by.full_name', read_only=True, default=None)
+    # The revision's own component snapshot (empty for older revisions,
+    # which payroll still calculates from the live structure).
+    components = EmployeeSalaryComponentSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = EmployeeSalaryConfig
+        fields = [
+            'id',
+            'employee',
+            'employee_name',
+            'employee_id_code',
+            'annual_ctc',
+            'monthly_ctc',
+            'salary_structure',
+            'structure_name',
+            'template_structure',
+            'template_structure_name',
+            'components',
+            'effective_from',
+            'pf_eligible',
+            'esi_eligible',
+            'pt_applicable',
+            'is_active',
+            'created_by_name',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'employee_name', 'employee_id_code',
+            'structure_name', 'monthly_ctc', 'template_structure', 'template_structure_name', 'components',
+            'created_by_name', 'created_at', 'updated_at',
+        ]
+
+
+class PayrollCycleSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source='created_by.full_name', read_only=True)
+    l1_approver_name = serializers.CharField(
+        source='attendance_approved_by_l1.full_name', read_only=True,
+    )
+    l2_approver_name = serializers.CharField(
+        source='attendance_approved_by_l2.full_name', read_only=True,
+    )
+    cancelled_by_name = serializers.CharField(source='cancelled_by.full_name', read_only=True)
+    payslip_count = serializers.SerializerMethodField()
+    branch_name = serializers.CharField(source='branch.branch_name', read_only=True)
+
+    class Meta:
+        model = PayrollCycle
+        fields = [
+            'id',
+            'cycle_start',
+            'cycle_end',
+            'pay_date',
+            'status',
+            'branch',
+            'branch_name',
+            'created_by',
+            'created_by_name',
+            'attendance_approved_by_l1',
+            'l1_approver_name',
+            'attendance_approved_by_l2',
+            'l2_approver_name',
+            'attendance_l1_approved_at',
+            'attendance_l2_approved_at',
+            'hr_self_approved_at',
+            'query_window_closes_at',
+            'paid_at',
+            'cancelled_at',
+            'cancelled_by',
+            'cancelled_by_name',
+            'cancellation_reason',
+            'notes',
+            'payslip_count',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'status', 'branch_name',
+            'created_by', 'created_by_name',
+            'attendance_approved_by_l1', 'l1_approver_name',
+            'attendance_approved_by_l2', 'l2_approver_name',
+            'attendance_l1_approved_at', 'attendance_l2_approved_at',
+            'query_window_closes_at', 'paid_at',
+            'cancelled_at', 'cancelled_by', 'cancelled_by_name', 'cancellation_reason',
+            'payslip_count', 'created_at', 'updated_at',
+        ]
+
+    def get_payslip_count(self, obj):
+        return obj.payslips.count()
+
+
+class ManagerAttendanceApprovalSerializer(serializers.ModelSerializer):
+    manager_name = serializers.CharField(source='manager.full_name', read_only=True)
+    manager_email = serializers.CharField(source='manager.email', read_only=True)
+
+    class Meta:
+        model = ManagerAttendanceApproval
+        fields = [
+            'id',
+            'cycle',
+            'manager',
+            'manager_name',
+            'manager_email',
+            'approved_at',
+            'self_approved_at',
+            'note',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'cycle', 'manager', 'manager_name', 'manager_email',
+            'created_at', 'updated_at',
+        ]
+
+
+class EmployeePayslipSerializer(serializers.ModelSerializer):
+    # Employee / company details come from the copy saved at processing
+    # (identity_snapshot), so later edits don't change an issued payslip;
+    # payslips processed before the copy existed fall back to live values.
+    employee_name = serializers.SerializerMethodField()
+    employee_id_code = serializers.SerializerMethodField()
+    department = serializers.SerializerMethodField()
+    designation = serializers.SerializerMethodField()
+    branch = serializers.SerializerMethodField()
+    principal_employer_name = serializers.SerializerMethodField()
+    company_header = serializers.SerializerMethodField()
+    payslip_template = serializers.SerializerMethodField()
+    # Masked / hidden per PayrollSettings, server-side.
+    uan_display = serializers.SerializerMethodField()
+    esic_display = serializers.SerializerMethodField()
+    # Wage-slip presentation settings (live — layout configuration, not payroll data).
+    fixed_deduction_rows = serializers.SerializerMethodField()
+    stamp_url = serializers.SerializerMethodField()
+    cycle_start = serializers.DateField(source='cycle.cycle_start', read_only=True)
+    cycle_end = serializers.DateField(source='cycle.cycle_end', read_only=True)
+    pay_date = serializers.DateField(source='cycle.pay_date', read_only=True)
+    structure_name = serializers.CharField(source='salary_structure.name', read_only=True, default=None)
+    open_query_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = EmployeePayslip
+        fields = [
+            'id',
+            'cycle',
+            'cycle_start',
+            'cycle_end',
+            'pay_date',
+            'employee',
+            'employee_name',
+            'employee_id_code',
+            'department',
+            'designation',
+            'branch',
+            'principal_employer_name',
+            'company_header',
+            'payslip_template',
+            'uan_display',
+            'esic_display',
+            'fixed_deduction_rows',
+            'stamp_url',
+            'salary_structure',
+            'structure_name',
+            'annual_ctc',
+            'monthly_ctc',
+            'basic',
+            'hra',
+            'special_allowance',
+            'other_earnings',
+            'other_deductions',
+            'reimbursements',
+            'bonus',
+            'bonus_breakdown',
+            'gross_earnings',
+            'total_working_days',
+            'lop_days',
+            'lop_deduction',
+            'pf_employee',
+            'pf_employer',
+            'esi_employee',
+            'esi_employer',
+            'pt_deduction',
+            'lwf_employee',
+            'lwf_employer',
+            'adjustments_earning',
+            'adjustments_deduction',
+            'adjustment_items',
+            'total_deductions',
+            'net_pay',
+            'status',
+            'payslip_pdf',
+            'sent_at',
+            'query_deadline',
+            'paid_at',
+            'open_query_count',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'employee_name', 'employee_id_code', 'department', 'branch',
+            'cycle_start', 'cycle_end', 'pay_date',
+            'gross_earnings', 'lop_deduction', 'total_deductions', 'net_pay', 'other_deductions',
+            'status', 'payslip_pdf', 'sent_at', 'query_deadline', 'paid_at',
+            'open_query_count', 'created_at', 'updated_at', 'adjustment_items',
+        ]
+
+    def _identity(self, obj, key, live):
+        snap = obj.identity_snapshot or {}
+        return snap[key] if key in snap else live
+
+    def get_employee_name(self, obj):
+        return self._identity(obj, 'employee_name', obj.employee.full_name)
+
+    def get_employee_id_code(self, obj):
+        return self._identity(obj, 'employee_code', obj.employee.employee_id)
+
+    def get_department(self, obj):
+        return self._identity(obj, 'department', obj.employee.department)
+
+    def get_designation(self, obj):
+        return self._identity(obj, 'designation', obj.employee.designation)
+
+    def get_branch(self, obj):
+        return self._identity(obj, 'branch', obj.employee.branch)
+
+    def get_principal_employer_name(self, obj):
+        return (obj.identity_snapshot or {}).get('principal_employer_name') or ''
+
+    def get_company_header(self, obj):
+        return (obj.identity_snapshot or {}).get('company') or None
+
+    def get_payslip_template(self, obj):
+        # Payslips issued before layouts existed keep the standard layout.
+        return obj.template or PAYSLIP_TEMPLATE_STANDARD
+
+    def _payroll_settings(self):
+        # One lookup per response, shared by every payslip in a list.
+        root = self.root
+        if not hasattr(root, '_payroll_settings_cache'):
+            root._payroll_settings_cache = PayrollSettings.objects.first()
+        return root._payroll_settings_cache
+
+    def _statutory_number(self, obj, attr, show_flag, mask_flag):
+        ps = self._payroll_settings()
+        show = getattr(ps, show_flag, True) if ps else True
+        mask = getattr(ps, mask_flag, True) if ps else True
+        if not show:
+            return None
+        profile = getattr(obj.employee, 'profile', None)
+        return mask_statutory_number(getattr(profile, attr, '') if profile else '', show, mask)
+
+    def get_uan_display(self, obj):
+        return self._statutory_number(obj, 'uan_number', 'show_uan', 'mask_uan')
+
+    def get_esic_display(self, obj):
+        return self._statutory_number(obj, 'esi_number', 'show_esic', 'mask_esic')
+
+    def get_fixed_deduction_rows(self, obj):
+        ps = self._payroll_settings()
+        return list(ps.fixed_deduction_rows or []) if ps else []
+
+    def get_stamp_url(self, obj):
+        if self.get_payslip_template(obj) == PAYSLIP_TEMPLATE_STANDARD:
+            return None
+        root = self.root
+        if not hasattr(root, '_stamp_url_cache'):
+            ps = self._payroll_settings()
+            root._stamp_url_cache = signed_file_url(ps.payslip_stamp) if ps else None
+        return root._stamp_url_cache
+
+    def get_open_query_count(self, obj):
+        return obj.queries.filter(status=PayslipQuery.STATUS_OPEN).count()
+
+
+class PayrollAdjustmentSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.full_name', read_only=True)
+    employee_code = serializers.CharField(source='employee.employee_id', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.full_name', read_only=True)
+
+    class Meta:
+        model = PayrollAdjustment
+        fields = (
+            'id', 'employee', 'employee_name', 'employee_code',
+            'month', 'type', 'label', 'amount',
+            'created_by', 'created_by_name', 'created_at', 'updated_at',
+        )
+        read_only_fields = ('id', 'created_by', 'created_by_name', 'created_at', 'updated_at')
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('Amount must be greater than zero.')
+        return value
+
+    def validate_month(self, value):
+        # Normalise to first of the month
+        return value.replace(day=1)
+
+
+class PayslipQuerySerializer(serializers.ModelSerializer):
+    raised_by_name = serializers.CharField(source='raised_by.full_name', read_only=True)
+    resolved_by_name = serializers.CharField(source='resolved_by.full_name', read_only=True)
+    # Context for list screens (read-only additions; existing fields unchanged).
+    employee_id_code = serializers.CharField(source='payslip.employee.employee_id', read_only=True, default=None)
+    cycle_start = serializers.DateField(source='payslip.cycle.cycle_start', read_only=True, default=None)
+    # Resolution is the query's last change (no separate column), so updated_at once resolved.
+    resolved_at = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PayslipQuery
+        fields = [
+            'id',
+            'payslip',
+            'raised_by',
+            'raised_by_name',
+            'employee_id_code',
+            'cycle_start',
+            'description',
+            'status',
+            'resolved_by',
+            'resolved_by_name',
+            'resolution_note',
+            'resolved_at',
+            'created_at',
+            'updated_at',
+        ]
+
+    def get_resolved_at(self, obj):
+        return obj.updated_at if obj.status == PayslipQuery.STATUS_RESOLVED else None
+        read_only_fields = [
+            'id', 'raised_by', 'raised_by_name', 'status',
+            'resolved_by', 'resolved_by_name', 'created_at', 'updated_at',
+        ]

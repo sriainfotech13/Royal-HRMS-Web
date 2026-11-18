@@ -1,0 +1,396 @@
+export type PayslipTemplate = "standard" | "wage_slip";
+
+export interface PayrollSettings {
+  id: string;
+  cycle_start_day: number;
+  cycle_end_day: number;
+  pay_day: number;
+  approval_levels: "L1" | "L1_L2";
+  employee_query_window_hours: number;
+  enable_reimbursements: boolean;
+  enable_bonuses: boolean;
+  eps_rate: string;
+  edli_rate: string;
+  edli_wage_ceiling: string;
+  epf_admin_rate: string;
+  /** Payslip presentation (calculations are not affected). */
+  payslip_template: PayslipTemplate;
+  show_uan: boolean;
+  mask_uan: boolean;
+  show_esic: boolean;
+  mask_esic: boolean;
+  fixed_deduction_rows: string[];
+  payslip_stamp_url: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SalaryComponent {
+  id: string;
+  name: string;
+  component_type: "earning" | "deduction" | "allowance";
+  calculation_type: "percentage_of_ctc" | "percentage_of_basic" | "fixed";
+  /** Which payslip line it fills; payroll finds Basic by this, not by name. */
+  role: SalaryComponentRole;
+  value: string;
+  is_taxable: boolean;
+  is_active: boolean;
+  order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export type SalaryComponentRole = "basic" | "hra" | "special_allowance" | "other";
+
+/** One component of one employee's salary revision (saved snapshot). */
+export interface EmployeeSalaryComponent {
+  id: string;
+  source_component: string | null;
+  name: string;
+  component_type: SalaryComponent["component_type"];
+  calculation_type: SalaryComponent["calculation_type"];
+  role: SalaryComponentRole;
+  value: string;
+  monthly_amount: string;
+  annual_amount: string;
+  is_taxable: boolean;
+  is_enabled: boolean;
+  order: number;
+}
+
+export interface SalaryStructure {
+  id: string;
+  name: string;
+  description: string;
+  is_default: boolean;
+  is_active: boolean;
+  components: SalaryComponent[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SalaryStructureListItem {
+  id: string;
+  name: string;
+  description: string;
+  is_default: boolean;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StatutoryConfig {
+  id: string;
+  state: string;
+  state_name: string;
+  state_code: string;
+  pt_applicable: boolean;
+  pt_slabs: { min: number; max: number | null; amount: number }[];
+  esi_applicable: boolean;
+  esi_wage_ceiling: string;
+  esi_employee_rate: string;
+  esi_employer_rate: string;
+  esi_daily_wage_exemption_threshold: string;
+  lwf_applicable: boolean;
+  lwf_employee_amount: string;
+  lwf_employer_amount: string;
+  lwf_frequency: "monthly" | "halfyearly" | "annual";
+  lwf_due_months: number[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BranchPayrollConfig {
+  id: string;
+  branch: string;
+  branch_name: string;
+  branch_state: string;
+  salary_structure: string | null;
+  structure_name: string | null;
+  pf_applicable: boolean;
+  pf_employee_rate: string;
+  pf_employer_rate: string;
+  pf_wage_ceiling: string;
+  /** Blank = the company's payslip layout. */
+  payslip_template: PayslipTemplate | "";
+  /** Client / principal employer printed on this branch's wage slips. */
+  principal_employer_name: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EmployeeSalaryConfig {
+  id: string;
+  employee: string;
+  employee_name: string;
+  employee_id_code: string;
+  annual_ctc: string;
+  monthly_ctc: string;
+  salary_structure: string | null;
+  structure_name: string | null;
+  /** Structure the components were copied from (display only). */
+  template_structure?: string | null;
+  template_structure_name?: string | null;
+  /** Empty for older revisions, which payroll still calculates from the live structure. */
+  components?: EmployeeSalaryComponent[];
+  effective_from: string;
+  /** null = follow the branch / state policy; false = not deducted for this employee. */
+  pf_eligible?: boolean | null;
+  esi_eligible?: boolean | null;
+  pt_applicable?: boolean | null;
+  is_active: boolean;
+  /** Who saved the revision (null for revisions saved before this was recorded). */
+  created_by_name?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A component row as previewed / submitted from Assign CTC. */
+export interface SalaryComponentInput {
+  source_component: string | null;
+  name: string;
+  component_type: SalaryComponent["component_type"];
+  calculation_type: SalaryComponent["calculation_type"];
+  role: SalaryComponentRole;
+  value: string;
+  order: number;
+  is_taxable: boolean;
+  is_enabled: boolean;
+}
+
+export interface SalaryPreviewRow extends SalaryComponentInput {
+  monthly_amount: string;
+  annual_amount: string;
+}
+
+export interface SalaryPreviewTotals {
+  annual_ctc: string;
+  monthly_ctc: string;
+  monthly_earnings: string;
+  annual_earnings: string;
+  monthly_deductions: string;
+  annual_deductions: string;
+  annual_difference: string;
+}
+
+/** POST /payroll/employee-salary/ with dry_run=true. */
+export interface SalaryPreview {
+  template_structure: { id: string; name: string } | null;
+  components: SalaryPreviewRow[];
+  totals: SalaryPreviewTotals;
+  warnings: string[];
+  previous: null | {
+    id: string;
+    annual_ctc: string;
+    effective_from: string;
+    structure_name: string | null;
+    is_snapshot: boolean;
+    components: SalaryPreviewRow[];
+    totals: SalaryPreviewTotals;
+  };
+}
+
+export interface ProcessPayrollResult {
+  payslip_count: number;
+  skipped: string[];
+  /** Employees whose payslip came to ₹0 gross and net although a CTC is set. */
+  zero_gross?: string[];
+}
+
+export interface EligibleEmployee {
+  id: string;
+  employee_id: string;
+  full_name: string;
+  department: string;
+  designation: string;
+}
+
+export interface PayrollCycle {
+  id: string;
+  cycle_start: string;
+  cycle_end: string;
+  pay_date: string;
+  status: string;
+  branch: string | null;
+  branch_name: string | null;
+  created_by: string;
+  created_by_name: string;
+  l1_approver_name: string | null;
+  l2_approver_name: string | null;
+  attendance_l1_approved_at: string | null;
+  attendance_l2_approved_at: string | null;
+  query_window_closes_at: string | null;
+  paid_at: string | null;
+  cancelled_at: string | null;
+  cancelled_by: string | null;
+  cancelled_by_name: string | null;
+  cancellation_reason: string;
+  notes: string;
+  payslip_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+// GET /payroll/cycles/<id>/salary-transfer/status/ — dual-confirmation
+// readiness for Mark as Paid (see backend SalaryTransferStatusView).
+export interface SalaryTransferStatus {
+  employee_side_ready: boolean;
+  reason: string;
+  batch_status: "pending" | "confirmed" | "cancelled" | null;
+  confirmed_at: string | null;
+  confirmed_by: string | null;
+  item_count: number;
+}
+
+export interface ManagerApproval {
+  id: string;
+  cycle: string;
+  manager: string;
+  manager_name: string;
+  manager_email: string;
+  approved_at: string | null;
+  self_approved_at: string | null;
+  note: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ManagerApprovalStatus {
+  approvals: ManagerApproval[];
+  approved_count: number;
+  total_count: number;
+  all_approved: boolean;
+  current_user_pending: boolean;
+}
+
+export interface PayslipAdjustmentItem {
+  type: "addition" | "deduction" | "arrear";
+  label: string;
+  amount: string;
+}
+
+export interface PayslipCompanyHeader {
+  company_name: string;
+  address: string;
+  city: string;
+  state: string;
+  pin_code: string;
+  cin: string;
+}
+
+export interface EmployeePayslip {
+  id: string;
+  cycle: string;
+  cycle_start: string;
+  cycle_end: string;
+  pay_date: string;
+  employee: string;
+  employee_name: string;
+  employee_id_code: string;
+  department: string;
+  designation: string;
+  branch: string;
+  /** Details as printed (saved at processing; live for older payslips). */
+  principal_employer_name: string;
+  company_header: PayslipCompanyHeader | null;
+  payslip_template: PayslipTemplate;
+  /** Masked / hidden by the server per Payroll Settings → Payslip. */
+  uan_display: string | null;
+  esic_display: string | null;
+  fixed_deduction_rows: string[];
+  stamp_url: string | null;
+  salary_structure: string | null;
+  structure_name: string | null;
+  annual_ctc: string;
+  monthly_ctc: string;
+  basic: string;
+  hra: string;
+  special_allowance: string;
+  other_earnings: Record<string, number>;
+  /** Deduction-type salary components (included in total_deductions). */
+  other_deductions?: Record<string, number>;
+  reimbursements: string;
+  bonus: string;
+  bonus_breakdown: BonusEntry[];
+  gross_earnings: string;
+  total_working_days: number;
+  lop_days: string;
+  lop_deduction: string;
+  pf_employee: string;
+  pf_employer: string;
+  esi_employee: string;
+  esi_employer: string;
+  pt_deduction: string;
+  lwf_employee: string;
+  lwf_employer: string;
+  adjustments_earning: string;
+  adjustments_deduction: string;
+  /** One-time adjustments behind the totals (empty on payslips processed before this was saved). */
+  adjustment_items: PayslipAdjustmentItem[];
+  total_deductions: string;
+  net_pay: string;
+  status: "draft" | "sent" | "acknowledged" | "queried" | "resolved" | "paid";
+  payslip_pdf: string | null;
+  sent_at: string | null;
+  query_deadline: string | null;
+  paid_at: string | null;
+  open_query_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PayslipQuery {
+  id: string;
+  payslip: string;
+  raised_by: string;
+  raised_by_name: string;
+  description: string;
+  status: "open" | "resolved";
+  resolved_by: string | null;
+  resolved_by_name: string | null;
+  resolution_note: string;
+  /** Read-only context added for list screens. */
+  employee_id_code?: string | null;
+  cycle_start?: string | null;
+  resolved_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BonusEntry {
+  type: string;
+  amount: string;
+  note: string;
+}
+
+export interface ExpenseItem {
+  id: string;
+  title: string;
+  category: string;
+  amount: string;
+  expense_date: string;
+  already_included: boolean;
+}
+
+export interface EmployeeExpenseSummary {
+  payslip_id: string;
+  employee_id: string;
+  employee_name: string;
+  employee_code: string;
+  current_reimbursements: string;
+  expenses: ExpenseItem[];
+}
+
+export interface ReferralBonusItem {
+  id: string;
+  bonus_amount: string;
+  candidate_name: string;
+}
+
+export interface EmployeeReferralSummary {
+  payslip_id: string;
+  employee_id: string;
+  employee_name: string;
+  employee_code: string;
+  referral_bonuses: ReferralBonusItem[];
+}

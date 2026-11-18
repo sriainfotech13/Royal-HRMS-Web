@@ -1,0 +1,430 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useFetch } from "@/hooks/useFetch";
+import { usePermission } from "@/hooks/usePermission";
+import { API } from "@/lib/api/endpoints";
+import clientApi from "@/lib/clientApi";
+import { useToast } from "@/components/ToastProvider";
+import { ApprovalModal } from "../ApprovalModal";
+import LateJustificationReviewModal from "../../attendance/_components/LateJustificationReviewModal";
+import type { LateJustificationRow } from "@/types/lateJustification";
+import { LeaveRequest } from "../../leave/_data";
+import {
+  ApprovalItem, ApprovalKind, CorrectionListResponse,
+  DisplayStatus, ExpenseListResponse, ExpenseRequest, LeaveListResponse, PayslipListResponse, SeparationListResponse, WfhListResponse,
+  TYPE_TABS, correctionToItem, expenseToItem, leaveAutoVars, leaveToItem, payslipToItem, separationToItem, toSortableTime, wfhToItem,
+} from "../_data";
+import type { PayslipQuery } from "@/types/payroll";
+import { KIND_MODULES, hasModule } from "@/lib/modules";
+import { useModules } from "@/lib/modulesContext";
+import SummaryCards from "./SummaryCards";
+import ApprovalsToolbar from "./ApprovalsToolbar";
+import ApprovalsTable from "./ApprovalsTable";
+import RequestDetailDrawer from "./RequestDetailDrawer";
+import BulkConfirmModal from "./BulkConfirmModal";
+import ResolveQueryModal from "@/app/dashboard/payroll/_components/ResolveQueryModal";
+
+interface ModalState {
+  id:            string;
+  action:        "approve" | "reject";
+  label:         string;
+  kind:          "leave" | "expense";
+  employeeName:  string;
+  employeeEmail: string;
+  autoVars?:     Record<string, string>;
+}
+
+export default function TeamApprovalsSection() {
+  const router = useRouter();
+  const { showToast } = useToast();
+  // GET /payroll/queries/ falls back to "queries I personally raised" for a
+  // user without payroll.view (see PayslipQueryListView.get) — that's an
+  // employee's own request, not something to show in a team approval queue,
+  // so we only fetch it at all for viewers who can see the team-wide list.
+  const modules = useModules();
+  const on = (m: string) => hasModule(modules, m);
+  const canViewPayslipQueries = usePermission("payroll.view") && on("payroll");
+  const canResolvePayslip     = usePermission("payroll.edit");
+
+  // ── Data: fetch every kind up front (page_size capped at 100 server-side) —
+  // the summary cards and the "All Requests" tab both need the full picture,
+  // not just whatever the active tab happens to be looking at. ──
+  const { data: leaveRaw,      loading: leaveLoading,      error: leaveError,      refetch: refetchLeave } =
+    useFetch<LeaveListResponse>(on("leave") ? `${API.approvals.leaveRequests}?scope=team&page_size=100` : null);
+  const { data: expenseRaw,    loading: expenseLoading,    error: expenseError,    refetch: refetchExpense } =
+    useFetch<ExpenseListResponse>(on("expenses") ? `${API.approvals.expenseList}?page_size=100` : null);
+  const { data: correctionRaw, loading: correctionLoading, error: correctionError, refetch: refetchCorrections } =
+    useFetch<CorrectionListResponse>(on("attendance") ? `${API.attendance.corrections}?page_size=100` : null);
+  const { data: separationRaw, loading: separationLoading, error: separationError, refetch: refetchSeparation } =
+    useFetch<SeparationListResponse>(on("separation") ? `${API.separation.list}?scope=team&page_size=100` : null);
+  const { data: wfhRaw,        loading: wfhLoading,        error: wfhError,        refetch: refetchWfh } =
+    useFetch<WfhListResponse>(on("wfh") ? `${API.approvals.wfhRequests}?scope=team&page_size=100` : null);
+  const { data: payslipRaw,    loading: payslipLoading,    error: payslipError,    refetch: refetchPayslip } =
+    useFetch<PayslipListResponse>(canViewPayslipQueries ? API.payroll.queries : null);
+
+  useEffect(() => {
+    function handleLeaveUpdate() { refetchLeave(); }
+    window.addEventListener("leave:updated", handleLeaveUpdate);
+    return () => window.removeEventListener("leave:updated", handleLeaveUpdate);
+  }, [refetchLeave]);
+
+  function refetchAll() { refetchLeave(); refetchExpense(); refetchCorrections(); refetchSeparation(); refetchWfh(); refetchPayslip(); }
+
+  const allItems: ApprovalItem[] = useMemo(() => [
+    ...(leaveRaw?.results ?? []).map(leaveToItem),
+    ...(expenseRaw?.results ?? []).map(expenseToItem),
+    ...(correctionRaw?.results ?? []).map(correctionToItem),
+    ...(separationRaw?.results ?? []).map(separationToItem),
+    ...(wfhRaw?.results ?? []).map(wfhToItem),
+    ...(payslipRaw ?? []).map(r => payslipToItem(r, canResolvePayslip)),
+  ], [leaveRaw, expenseRaw, correctionRaw, separationRaw, wfhRaw, payslipRaw, canResolvePayslip]);
+
+  const counts = useMemo(() => {
+    const pendingOf = (kind: ApprovalKind) => allItems.filter(i => i.kind === kind && i.displayStatus === "pending").length;
+    const leave = pendingOf("leave");
+    const expense = pendingOf("expense");
+    const correction = pendingOf("attendance_correction");
+    const separation = pendingOf("separation");
+    const wfh = pendingOf("wfh");
+    const payslip = pendingOf("payslip");
+    return { leave, expense, correction, separation, wfh, payslip, pending: leave + expense + correction + separation + wfh + payslip };
+  }, [allItems]);
+
+  const tabCounts = useMemo(() => ({
+    all: counts.pending,
+    leave: counts.leave,
+    expense: counts.expense,
+    attendance_correction: counts.correction,
+    payslip: counts.payslip,
+    separation: counts.separation,
+    wfh: counts.wfh,
+  }), [counts]);
+
+  // ── Tabs + toolbar filter state ──
+  const [activeTab,    setActiveTab]    = useState<"all" | ApprovalKind>("all");
+  const [search,       setSearch]       = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | DisplayStatus>("pending");
+  const [typeFilter,   setTypeFilter]   = useState<"all" | ApprovalKind>("all");
+  const [dateFrom,     setDateFrom]     = useState("");
+  const [dateTo,       setDateTo]       = useState("");
+  const [selected,     setSelected]     = useState<Set<string>>(new Set());
+
+  useEffect(() => { setSelected(new Set()); }, [activeTab]);
+
+  const filteredItems = useMemo(() => {
+    return allItems.filter(item => {
+      if (activeTab !== "all" && item.kind !== activeTab) return false;
+      if (activeTab === "all" && typeFilter !== "all" && item.kind !== typeFilter) return false;
+      if (statusFilter !== "all" && item.displayStatus !== statusFilter) return false;
+      if (search.trim()) {
+        const q = search.trim().toLowerCase();
+        if (!item.employeeName.toLowerCase().includes(q) && !item.employeeCode.toLowerCase().includes(q)) return false;
+      }
+      if (dateFrom && toSortableTime(item.submittedAt) < new Date(`${dateFrom}T00:00:00`).getTime()) return false;
+      if (dateTo   && toSortableTime(item.submittedAt) > new Date(`${dateTo}T23:59:59`).getTime())   return false;
+      return true;
+    });
+  }, [allItems, activeTab, typeFilter, statusFilter, search, dateFrom, dateTo]);
+
+  const resetKey = `${activeTab}|${typeFilter}|${statusFilter}|${search}|${dateFrom}|${dateTo}`;
+
+  // ── Selection ── Separation is a multi-stage workflow (approving it means
+  // acting on one specific pending stage, not the request as a whole), so it
+  // doesn't fit the single-decision bulk approve/reject below — excluded from
+  // selection entirely; its rows are actioned individually via the detail page.
+  // Payslip requests are excluded too — resolving requires a per-query
+  // resolution note, which doesn't fit a single shared bulk remarks field.
+  const UNSELECTABLE_KINDS: ApprovalKind[] = ["separation", "payslip"];
+  function toggleSelect(key: string) {
+    const kind = allItems.find(i => i.key === key)?.kind;
+    if (kind && UNSELECTABLE_KINDS.includes(kind)) return;
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }
+  function toggleSelectMany(keys: string[], select: boolean) {
+    const selectable = keys.filter(k => {
+      const kind = allItems.find(i => i.key === k)?.kind;
+      return !(kind && UNSELECTABLE_KINDS.includes(kind));
+    });
+    setSelected(prev => {
+      const next = new Set(prev);
+      selectable.forEach(k => { if (select) next.add(k); else next.delete(k); });
+      return next;
+    });
+  }
+
+  // ── Drawer ── separation has its own detail page with the full stage/
+  // clearance/handover UI, so "View" goes there instead of this generic drawer.
+  const [drawerItem, setDrawerItem] = useState<ApprovalItem | null>(null);
+  // Late-arrival justifications open their own review (reason required to
+  // reject / send back; proof only for authorised HR) instead of the drawer.
+  const [lateReview, setLateReview] = useState<LateJustificationRow | null>(null);
+  const isLate = (item: ApprovalItem) =>
+    item.kind === "attendance_correction" && (item.raw as { kind?: string }).kind === "late_justification";
+  function handleView(item: ApprovalItem) {
+    if (item.kind === "separation") { router.push(`/dashboard/separation/${item.id}`); return; }
+    if (isLate(item)) { setLateReview(item.raw as unknown as LateJustificationRow); return; }
+    setDrawerItem(item);
+  }
+
+  // ── Single-row approve/reject ──
+  const [modal,  setModal]  = useState<ModalState | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [apiErr, setApiErr] = useState("");
+  const [resolveTarget, setResolveTarget] = useState<PayslipQuery | null>(null);
+
+  function handleApproveClick(item: ApprovalItem) { dispatchAction(item, "approve"); }
+  function handleRejectClick(item: ApprovalItem)  { dispatchAction(item, "reject"); }
+
+  function dispatchAction(item: ApprovalItem, action: "approve" | "reject") {
+    setDrawerItem(null);
+    // Separation approval is per-stage (Manager, then HR/Branch Admin) rather
+    // than a single yes/no decision, so it's actioned on its own detail page
+    // (which already has the full stage/clearance UI) instead of this modal.
+    if (item.kind === "separation") {
+      router.push(`/dashboard/separation/${item.id}`);
+      return;
+    }
+    // A payslip query has one real action — resolve — not a separate
+    // approve/reject, so both icons open the same existing resolve flow
+    // (reused from Payroll → Payslip Queries, not duplicated).
+    if (item.kind === "payslip") {
+      setResolveTarget(item.raw as PayslipQuery);
+      return;
+    }
+    if (isLate(item)) {
+      setLateReview(item.raw as unknown as LateJustificationRow);
+      return;
+    }
+    if (item.kind === "attendance_correction") {
+      runCorrectionAction(item.id, action);
+      return;
+    }
+    // WFH has no email-template step configured (out of scope for now) — a
+    // direct action, same simpler no-modal path as attendance correction,
+    // rather than forcing it through ApprovalModal's leave/expense template
+    // picker with nothing relevant to select.
+    if (item.kind === "wfh") {
+      runWfhAction(item.id, action);
+      return;
+    }
+    if (item.kind === "leave") {
+      const r = item.raw as LeaveRequest;
+      setModal({
+        id: item.id, action, label: `${item.employeeName}'s leave`, kind: "leave",
+        employeeName: item.employeeName, employeeEmail: "", autoVars: leaveAutoVars(r),
+      });
+    } else {
+      const r = item.raw as ExpenseRequest;
+      setModal({
+        id: item.id, action, label: `${item.employeeName}'s expense`, kind: "expense",
+        employeeName: item.employeeName, employeeEmail: r.employee_email ?? "",
+      });
+    }
+  }
+
+  async function runCorrectionAction(id: string, action: "approve" | "reject") {
+    try {
+      await clientApi.patch(API.attendance.correctionReview(id), { action });
+      showToast(action === "approve" ? "Correction approved. Attendance record updated." : "Correction rejected.", "success");
+      refetchCorrections();
+    } catch (err: unknown) {
+      const message = (err as { message?: string })?.message ?? "Failed to review correction.";
+      showToast(message, "error");
+    }
+  }
+
+  async function runWfhAction(id: string, action: "approve" | "reject") {
+    try {
+      await clientApi.post(API.approvals.approveWfh(id), { action });
+      showToast(action === "approve" ? "Work from home request approved." : "Work from home request rejected.", "success");
+      refetchWfh();
+    } catch (err: unknown) {
+      const message = (err as { response?: { data?: { message?: string } } })?.response?.data?.message ?? "Failed to review request.";
+      showToast(message, "error");
+    }
+  }
+
+  async function handleModalConfirm(
+    remarks: string,
+    templateName?: string,
+    extraContext?: Record<string, string>,
+  ) {
+    if (!modal) return;
+    setSaving(true); setApiErr("");
+    try {
+      if (modal.kind === "leave") {
+        await clientApi.post(API.approvals.approveLeave(modal.id), {
+          action: modal.action, remarks, template_name: templateName, extra_context: extraContext,
+        });
+        refetchLeave();
+      } else {
+        await clientApi.put(API.expenses.detail(modal.id), {
+          status: modal.action === "approve" ? "approved" : "rejected",
+          remarks, template_name: templateName, extra_context: extraContext,
+        });
+        refetchExpense();
+      }
+      showToast(modal.action === "approve" ? "Request approved." : "Request rejected.", "success");
+      setModal(null);
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message;
+      setApiErr(msg || "Action failed. Please try again.");
+    } finally { setSaving(false); }
+  }
+
+  // ── Bulk approve/reject ──
+  const [bulkAction, setBulkAction] = useState<"approve" | "reject" | null>(null);
+  const [bulkSaving, setBulkSaving] = useState(false);
+
+  async function handleBulkConfirm(remarks: string) {
+    if (!bulkAction) return;
+    setBulkSaving(true);
+    const targets = allItems.filter(i => selected.has(i.key));
+    const results = await Promise.allSettled(targets.map(item => {
+      if (item.kind === "leave") {
+        return clientApi.post(API.approvals.approveLeave(item.id), { action: bulkAction, remarks });
+      }
+      if (item.kind === "expense") {
+        return clientApi.put(API.expenses.detail(item.id), {
+          status: bulkAction === "approve" ? "approved" : "rejected", remarks,
+        });
+      }
+      if (item.kind === "wfh") {
+        return clientApi.post(API.approvals.approveWfh(item.id), { action: bulkAction });
+      }
+      return clientApi.patch(API.attendance.correctionReview(item.id), { action: bulkAction });
+    }));
+
+    const succeeded = results.filter(r => r.status === "fulfilled").length;
+    const failed = results.length - succeeded;
+    const verb = bulkAction === "approve" ? "approved" : "rejected";
+    showToast(
+      failed === 0
+        ? `${succeeded} request${succeeded === 1 ? "" : "s"} ${verb}.`
+        : `${succeeded} ${verb}, ${failed} failed — please retry those individually.`,
+      failed === 0 ? "success" : "error",
+    );
+
+    setSelected(new Set());
+    setBulkAction(null);
+    setBulkSaving(false);
+    refetchAll();
+  }
+
+  const initialLoading = (leaveLoading || expenseLoading || correctionLoading || separationLoading || wfhLoading || payslipLoading) && allItems.length === 0;
+  const refreshing     = leaveLoading || expenseLoading || correctionLoading || separationLoading || wfhLoading || payslipLoading;
+  const loadError      = leaveError || expenseError || correctionError || separationError || wfhError || payslipError;
+
+  return (
+    <div className="ta-root">
+      <SummaryCards pending={counts.pending} leave={counts.leave} expense={counts.expense} correction={counts.correction} loading={initialLoading}
+        show={{ leave: on("leave"), expense: on("expenses"), correction: on("attendance") }} />
+
+      <div className="ta-tabs">
+        {TYPE_TABS.filter(t => t.key === "all" || on(KIND_MODULES[t.key])).map(t => (
+          <button
+            key={t.key}
+            className={`ta-tab ${activeTab === t.key ? "active" : ""}`}
+            onClick={() => setActiveTab(t.key)}
+            suppressHydrationWarning
+          >
+            <i className={`ti ${t.icon}`} />
+            {t.label}
+            <span className="ta-tab-count">{tabCounts[t.key]}</span>
+          </button>
+        ))}
+      </div>
+
+      {loadError && (
+        <div className="alert alert-error mb-16"><i className="ti ti-alert-circle" /> {loadError}</div>
+      )}
+
+      <ApprovalsToolbar
+        search={search} onSearch={setSearch}
+        status={statusFilter} onStatus={setStatusFilter}
+        showTypeFilter={activeTab === "all"}
+        type={typeFilter} onType={setTypeFilter}
+        dateFrom={dateFrom} onDateFrom={setDateFrom}
+        dateTo={dateTo} onDateTo={setDateTo}
+        onRefresh={refetchAll}
+        refreshing={refreshing}
+      />
+
+      <ApprovalsTable
+        items={filteredItems}
+        loading={initialLoading}
+        resetKey={resetKey}
+        selected={selected}
+        onToggleSelect={toggleSelect}
+        onToggleSelectMany={toggleSelectMany}
+        onView={handleView}
+        onApprove={handleApproveClick}
+        onReject={handleRejectClick}
+        onBulkApprove={() => setBulkAction("approve")}
+        onBulkReject={() => setBulkAction("reject")}
+        bulkBusy={bulkSaving}
+      />
+
+      <RequestDetailDrawer
+        item={drawerItem}
+        onClose={() => setDrawerItem(null)}
+        onApprove={handleApproveClick}
+        onReject={handleRejectClick}
+      />
+
+      {apiErr && (
+        <div className="alert alert-error" style={{ position: "fixed", bottom: 20, right: 20, zIndex: 1200, maxWidth: 360 }}>
+          <i className="ti ti-alert-circle" /> {apiErr}
+        </div>
+      )}
+
+      {modal && (
+        <ApprovalModal
+          action={modal.action}
+          itemLabel={modal.label}
+          employeeName={modal.employeeName}
+          employeeEmail={modal.employeeEmail}
+          kind={modal.kind}
+          entityId={modal.id}
+          autoVars={modal.autoVars}
+          onConfirm={handleModalConfirm}
+          onClose={() => { setModal(null); setApiErr(""); }}
+          saving={saving}
+        />
+      )}
+
+      {bulkAction && (
+        <BulkConfirmModal
+          action={bulkAction}
+          count={selected.size}
+          saving={bulkSaving}
+          onConfirm={handleBulkConfirm}
+          onClose={() => setBulkAction(null)}
+        />
+      )}
+
+      {lateReview && (
+        <LateJustificationReviewModal request={lateReview} onClose={() => setLateReview(null)}
+          onDone={m => { showToast(m, "success"); refetchCorrections(); }} />
+      )}
+
+      {resolveTarget && (
+        <ResolveQueryModal
+          query={resolveTarget}
+          onClose={() => setResolveTarget(null)}
+          onResolved={() => {
+            setResolveTarget(null);
+            showToast("Payslip query resolved.", "success");
+            refetchPayslip();
+          }}
+        />
+      )}
+    </div>
+  );
+}

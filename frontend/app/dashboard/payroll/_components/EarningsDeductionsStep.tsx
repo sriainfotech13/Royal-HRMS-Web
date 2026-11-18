@@ -1,0 +1,381 @@
+"use client";
+
+import { Fragment, useEffect, useState } from "react";
+import { useFetch } from "@/hooks/useFetch";
+import clientApi from "@/lib/clientApi";
+import { API } from "@/lib/api/endpoints";
+import type { EligibleEmployee, EmployeePayslip, ProcessPayrollResult } from "@/types/payroll";
+
+interface Props {
+  cycleId: string;
+  onNext: () => void;
+  onBack: () => void;
+}
+
+interface PagedResponse<T> { results: T[]; count: number; }
+
+const fmt = (n: number | string) =>
+  `₹${Number(n).toLocaleString("en-IN", { minimumFractionDigits: 0 })}`;
+
+export default function EarningsDeductionsStep({ cycleId, onNext, onBack }: Props) {
+  const [processing, setProcessing] = useState(false);
+  const [processed, setProcessed]   = useState(false);
+  const [processErr, setProcessErr] = useState<string | null>(null);
+  const [expanded, setExpanded]     = useState<string | null>(null);
+  const [skipped, setSkipped]       = useState<string[]>([]);
+  const [zeroGross, setZeroGross]   = useState<string[]>([]);
+
+  // Always fetch payslips — if they already exist (cycle previously computed), show results directly.
+  const { data: payslipPage, loading, refetch } =
+    useFetch<PagedResponse<EmployeePayslip>>(API.payroll.cyclePayslips(cycleId));
+
+  const payslips = payslipPage?.results ?? [];
+  // Show results view if user just computed OR if payslips already existed from a prior run
+  const showResults = processed || (payslipPage !== null && payslips.length > 0);
+
+  // Eligible-employee selection — only relevant before the first compute; the
+  // Recompute button on the results view below is unchanged (always a full
+  // reprocess, exactly as before this feature existed).
+  const { data: eligibleData } = useFetch<{ results: EligibleEmployee[]; count: number }>(
+    showResults ? null : API.payroll.eligibleEmployees(cycleId)
+  );
+  const eligible = eligibleData?.results ?? [];
+  const [selectedIds, setSelectedIds] = useState<Set<string> | null>(null);
+
+  // Default: everyone selected, the moment the eligible list arrives —
+  // matches "HR opens payroll processing → all eligible employees are
+  // already selected" exactly.
+  useEffect(() => {
+    if (eligibleData && selectedIds === null) {
+      setSelectedIds(new Set(eligibleData.results.map(e => e.employee_id)));
+    }
+  }, [eligibleData, selectedIds]);
+
+  const selectedCount = selectedIds?.size ?? 0;
+  const allSelected = selectedIds !== null && eligible.length > 0 && selectedCount === eligible.length;
+
+  function toggleEmployee(code: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev ?? []);
+      if (next.has(code)) next.delete(code); else next.add(code);
+      return next;
+    });
+  }
+
+  function toggleSelectAll() {
+    setSelectedIds(allSelected ? new Set() : new Set(eligible.map(e => e.employee_id)));
+  }
+
+  async function runProcess() {
+    setProcessing(true);
+    setProcessErr(null);
+    try {
+      // Send an explicit employee_ids list only when HR has deliberately
+      // narrowed the selection — "everyone selected" (including before the
+      // eligible list has even loaded, e.g. Recompute) omits the field
+      // entirely, preserving the exact original all-eligible-employees
+      // backend behavior rather than freezing a possibly-stale employee list.
+      const body = selectedIds !== null && !allSelected
+        ? { employee_ids: Array.from(selectedIds) }
+        : undefined;
+      const res = await clientApi.post<{ data: ProcessPayrollResult }>(API.payroll.processCycle(cycleId), body);
+      setSkipped(res.data.data.skipped ?? []);
+      setZeroGross(res.data.data.zero_gross ?? []);
+      setProcessed(true);
+      refetch();
+    } catch (error: unknown) {
+      const msg = (error as { response?: { data?: { message?: string } } })?.response?.data?.message
+        ?? "Failed to process payroll. Check that the cycle is approved.";
+      setProcessErr(msg);
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  const totalGross = payslips.reduce((s, p) => s + Number(p.gross_earnings), 0);
+  const totalDed   = payslips.reduce((s, p) => s + Number(p.total_deductions), 0);
+  const totalNet   = payslips.reduce((s, p) => s + Number(p.net_pay), 0);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+      {/* Process trigger card */}
+      {!showResults && (
+        <div className="card">
+          <div className="card-body" style={{ textAlign: "center", padding: "40px 20px" }}>
+            <i className="ti ti-calculator" style={{ fontSize: 44, color: "var(--primary)", display: "block", marginBottom: 12 }} />
+            <h3 style={{ marginBottom: 8, color: "var(--on-bg)" }}>Compute Payroll</h3>
+            <p style={{ color: "var(--on-variant)", marginBottom: 20, maxWidth: 440, margin: "0 auto 20px" }}>
+              This will calculate salaries for all eligible employees using their CTC, salary structure, and statutory rules for each branch.
+            </p>
+
+            {eligible.length > 0 && (
+              <div style={{ textAlign: "left", maxWidth: 440, margin: "0 auto 20px", border: "1px solid var(--outline-v)", borderRadius: "var(--radius)" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", borderBottom: "1px solid var(--outline-v)" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+                    <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} />
+                    Select All
+                  </label>
+                  <span style={{ fontSize: 12, color: "var(--on-variant)" }}>
+                    Selected: {selectedCount} of {eligible.length} employees
+                  </span>
+                </div>
+                <div style={{ maxHeight: 220, overflowY: "auto" }}>
+                  {eligible.map(emp => (
+                    <label
+                      key={emp.employee_id}
+                      style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", fontSize: 13, cursor: "pointer", borderBottom: "1px solid var(--outline-v)" }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedIds?.has(emp.employee_id) ?? false}
+                        onChange={() => toggleEmployee(emp.employee_id)}
+                      />
+                      <span style={{ flex: 1 }}>{emp.full_name}</span>
+                      <span style={{ color: "var(--on-variant)", fontSize: 12 }}>{emp.department}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {processErr && (
+              <div className="alert alert-error" style={{ marginBottom: 16, textAlign: "left" }}>
+                <i className="ti ti-alert-circle" />
+                <span>{processErr}</span>
+              </div>
+            )}
+
+            {eligible.length > 0 && selectedCount === 0 && (
+              <div className="alert alert-warn" style={{ marginBottom: 16, textAlign: "left" }}>
+                <i className="ti ti-alert-triangle" />
+                <span>Select at least one employee to process.</span>
+              </div>
+            )}
+
+            <button
+              className="btn btn-filled"
+              onClick={runProcess}
+              // The "must select someone" guard only applies once we actually
+              // have a non-empty eligible list to select from — an empty/not-
+              // yet-loaded list falls back to the original disabled={processing}
+              // behavior rather than a permanently-disabled button.
+              disabled={processing || (eligible.length > 0 && selectedCount === 0)}
+              style={{ minWidth: 180 }}
+            >
+              {processing
+                ? <><i className="ti ti-loader-2 animate-spin" /> Computing…</>
+                : <><i className="ti ti-calculator" /> Compute Salaries</>}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Results */}
+      {showResults && (
+        <>
+          {zeroGross.length > 0 && (
+            <div className="alert alert-warn" style={{ alignItems: "flex-start" }}>
+              <i className="ti ti-alert-triangle" />
+              <span>
+                {zeroGross.length} payslip{zeroGross.length > 1 ? "s" : ""} came to ₹0 although a CTC is set: {zeroGross.join(", ")}.
+                Their salary components produced no amount (for example a &ldquo;% of Basic&rdquo; component with nothing on the Basic
+                payslip line). Fix the salary in Payroll → Salary Setup and reprocess — the salary transfer can&apos;t be confirmed until then.
+              </span>
+            </div>
+          )}
+          {skipped.length > 0 && (
+            <div className="alert alert-warn" style={{ alignItems: "flex-start" }}>
+              <i className="ti ti-alert-triangle" />
+              <span>
+                {skipped.length} employee{skipped.length > 1 ? "s were" : " was"} skipped — no salary structure or CTC configured: {skipped.join(", ")}.
+                Set up their salary in Employees → Salary tab, then reprocess to include them.
+              </span>
+            </div>
+          )}
+
+          {/* Summary row */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
+            <div className="stat-card">
+              <div className="stat-label">Total Gross</div>
+              <div className="stat-value" style={{ color: "var(--primary)" }}>{fmt(totalGross)}</div>
+              <div className="stat-sub">{payslips.length} employees</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Total Deductions</div>
+              <div className="stat-value" style={{ color: "var(--error)" }}>{fmt(totalDed)}</div>
+              <div className="stat-sub">PF + ESI + PT + LWF</div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-label">Net Payable</div>
+              <div className="stat-value" style={{ color: "var(--success)" }}>{fmt(totalNet)}</div>
+              <div className="stat-sub">Gross − Deductions</div>
+            </div>
+          </div>
+
+          {/* Earnings table */}
+          <div className="card">
+            <div className="card-header">
+              <div className="card-title"><i className="ti ti-cash" /> Earnings Breakdown</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn btn-outline btn-sm" onClick={runProcess} disabled={processing}>
+                  {processing
+                    ? <><i className="ti ti-loader-2 animate-spin" /> Recomputing…</>
+                    : <><i className="ti ti-calculator" /> Recompute</>}
+                </button>
+                <button className="btn btn-outline btn-sm" onClick={refetch} disabled={processing}>
+                  <i className="ti ti-refresh" /> Refresh
+                </button>
+              </div>
+            </div>
+
+            {processErr && (
+              <div className="alert alert-error" style={{ margin: "0 16px 0", borderRadius: 0 }}>
+                <i className="ti ti-alert-circle" />
+                <span>{processErr}</span>
+              </div>
+            )}
+
+            {loading ? (
+              <div style={{ padding: "32px", textAlign: "center", color: "var(--on-variant)" }}>
+                <i className="ti ti-loader-2 animate-spin" style={{ fontSize: 24 }} />
+              </div>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Employee</th>
+                      <th style={{ textAlign: "right" }}>Basic</th>
+                      <th style={{ textAlign: "right" }}>HRA</th>
+                      <th style={{ textAlign: "right" }}>Spl. Allow.</th>
+                      <th style={{ textAlign: "right" }}>LOP Days</th>
+                      <th style={{ textAlign: "right", color: "var(--success)" }}>Gross</th>
+                      <th style={{ textAlign: "right", color: "var(--error)" }}>Deductions</th>
+                      <th style={{ textAlign: "right", color: "var(--success)" }}>Net Pay</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {payslips.map(p => {
+                      const isOpen = expanded === p.id;
+                      return (
+                        <Fragment key={p.id}>
+                          <tr style={{ cursor: "pointer" }} onClick={() => setExpanded(isOpen ? null : p.id)}>
+                            <td>
+                              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                                <div style={{ width: 30, height: 30, borderRadius: "50%", background: "var(--primary)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700 }}>
+                                  {p.employee_name.charAt(0)}
+                                </div>
+                                <div>
+                                  <div style={{ fontWeight: 600, fontSize: 13 }}>{p.employee_name}</div>
+                                  <div style={{ fontSize: 11, color: "var(--on-variant)" }}>
+                                    {p.department} · {p.branch}
+                                    {p.structure_name && (
+                                      <span style={{ marginLeft: 6, color: "var(--outline)" }}>· {p.structure_name}</span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            </td>
+                            <td style={{ textAlign: "right", fontSize: 13 }}>{fmt(p.basic)}</td>
+                            <td style={{ textAlign: "right", fontSize: 13 }}>{fmt(p.hra)}</td>
+                            <td style={{ textAlign: "right", fontSize: 13 }}>{fmt(p.special_allowance)}</td>
+                            <td style={{ textAlign: "right", fontSize: 13, color: Number(p.lop_days) > 0 ? "var(--error)" : "var(--on-variant)" }}>
+                              {Number(p.lop_days) > 0 ? p.lop_days : "—"}
+                            </td>
+                            <td style={{ textAlign: "right", fontWeight: 700, color: "var(--success)" }}>{fmt(p.gross_earnings)}</td>
+                            <td style={{ textAlign: "right", fontWeight: 600, color: "var(--error)" }}>{fmt(p.total_deductions)}</td>
+                            <td style={{ textAlign: "right", fontWeight: 700, color: "var(--success)", fontSize: 14 }}>{fmt(p.net_pay)}</td>
+                            <td>
+                              <i className={`ti ${isOpen ? "ti-chevron-up" : "ti-chevron-down"}`} style={{ color: "var(--outline)" }} />
+                            </td>
+                          </tr>
+                          {isOpen && (
+                            <tr key={`${p.id}-detail`} style={{ background: "var(--bg-low)" }}>
+                              <td colSpan={9} style={{ padding: "0" }}>
+                                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 0, padding: "16px 20px" }}>
+                                  {/* Deduction detail */}
+                                  <div>
+                                    <div style={{ fontSize: 11, fontWeight: 700, color: "var(--on-variant)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>Statutory Deductions</div>
+                                    {[
+                                      ["PF (Employee)", p.pf_employee],
+                                      ["ESI (Employee)", p.esi_employee],
+                                      ["Professional Tax", p.pt_deduction],
+                                      ["LWF (Employee)", p.lwf_employee],
+                                      ["LOP Deduction", p.lop_deduction],
+                                      ...Object.entries(p.other_deductions ?? {}).map(([name, amt]) => [name, String(amt)]),
+                                    ].map(([label, val]) => Number(val) > 0 && (
+                                      <div key={label as string} style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, fontSize: 13 }}>
+                                        <span style={{ color: "var(--on-variant)" }}>- {label}</span>
+                                        <span style={{ color: "var(--error)" }}>{fmt(val as string)}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                  {/* Employer contributions */}
+                                  <div style={{ paddingLeft: 20, borderLeft: "1px solid var(--outline-v)" }}>
+                                    <div style={{ fontSize: 11, fontWeight: 700, color: "var(--on-variant)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>Employer Contributions</div>
+                                    {[
+                                      ["PF (Employer)", p.pf_employer],
+                                      ["ESI (Employer)", p.esi_employer],
+                                      ["LWF (Employer)", p.lwf_employer],
+                                    ].map(([label, val]) => Number(val) > 0 && (
+                                      <div key={label as string} style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, fontSize: 13 }}>
+                                        <span style={{ color: "var(--on-variant)" }}>{label}</span>
+                                        <span style={{ color: "var(--info)" }}>{fmt(val as string)}</span>
+                                      </div>
+                                    ))}
+                                    <div style={{ marginTop: 12, padding: "8px 12px", background: "rgba(27,138,107,0.06)", borderRadius: "var(--radius)" }}>
+                                      <div style={{ fontSize: 11, color: "var(--on-variant)" }}>Net Pay Payable</div>
+                                      <div style={{ fontWeight: 800, fontSize: 18, color: "var(--success)" }}>{fmt(p.net_pay)}</div>
+                                    </div>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      );
+                    })}
+                    {payslips.length > 0 && (
+                      <tr style={{ background: "var(--bg-low)" }}>
+                        <td style={{ fontWeight: 700 }}>Total</td>
+                        <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(payslips.reduce((s, p) => s + Number(p.basic), 0))}</td>
+                        <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(payslips.reduce((s, p) => s + Number(p.hra), 0))}</td>
+                        <td style={{ textAlign: "right", fontWeight: 600 }}>{fmt(payslips.reduce((s, p) => s + Number(p.special_allowance), 0))}</td>
+                        <td />
+                        <td style={{ textAlign: "right", fontWeight: 700, color: "var(--success)" }}>{fmt(totalGross)}</td>
+                        <td style={{ textAlign: "right", fontWeight: 700, color: "var(--error)" }}>{fmt(totalDed)}</td>
+                        <td style={{ textAlign: "right", fontWeight: 700, color: "var(--success)" }}>{fmt(totalNet)}</td>
+                        <td />
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+
+                {payslips.length === 0 && !loading && (
+                  <div style={{ padding: "32px", textAlign: "center", color: "var(--on-variant)", fontSize: 13 }}>
+                    No payslips found. Employees may be missing CTC or salary structure.
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{ padding: "14px 20px", borderTop: "1px solid var(--outline-v)", display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button className="btn btn-ghost" onClick={onBack}><i className="ti ti-arrow-left" /> Back</button>
+              <button className="btn btn-filled" onClick={onNext} disabled={payslips.length === 0}>
+                Continue <i className="ti ti-arrow-right" />
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {!showResults && (
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 4 }}>
+          <button className="btn btn-ghost" onClick={onBack}><i className="ti ti-arrow-left" /> Back</button>
+        </div>
+      )}
+    </div>
+  );
+}

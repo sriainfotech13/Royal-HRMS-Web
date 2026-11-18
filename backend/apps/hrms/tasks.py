@@ -1,0 +1,291 @@
+"""
+HRMS Celery tasks.
+
+Registered in CELERY_BEAT_SCHEDULE (config/settings.py) for periodic execution.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import timedelta
+
+from celery import shared_task
+from django.db.models.functions import ExtractDay, ExtractMonth
+from django.utils import timezone
+
+logger = logging.getLogger(__name__)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=300)
+def reset_annual_leave_balances(self):
+    """
+    Annual task: runs on 1st Jan at 00:01 IST, once per active company (see
+    apps.tenants.utils.run_for_all_tenants — this task has no single tenant
+    of its own, it's scheduled, not dispatched from a request).
+
+    For every active employee:
+    - Checks each active LeavePolicy for eligibility via the shared
+      _eligible_for_policy() check (branch, dept, designation, gender,
+      minimum_service_period) — same function every other LeaveBalance-
+      creating path uses, see its docstring in apps/hrms/views/leave.py.
+    - Carries forward unused days from the previous year (capped by max_carry_forward_days).
+    - Creates a new LeaveBalance for the new year.
+
+    Idempotent: get_or_create — safe to re-run if the task fires twice.
+    """
+    from apps.tenants.models import MODULE_LEAVE
+    from apps.tenants.utils import run_for_all_tenants
+
+    def _run_for_one_tenant():
+        from decimal import Decimal
+        from apps.accounts.models import User
+        from apps.hrms.models import CARRY_FORWARD_MANUAL, CARRY_FORWARD_UNLIMITED, LeaveBalance, LeavePolicy
+        from apps.hrms.services_monthly_statement import (
+            annual_allocation, is_monthly, sync_expiries, unused_for_carry_forward,
+        )
+        from apps.hrms.views.leave import _eligible_for_policy
+
+        today    = timezone.localdate()
+        new_year = today.year
+        prev_year = new_year - 1
+
+        active_employees = list(
+            User.objects.filter(is_active=True, role__isnull=False, employee_id__isnull=False)
+            .select_related('profile')
+        )
+        # Automatic task only runs policies set to automatic carry-forward mode
+        policies = list(LeavePolicy.objects.filter(is_active=True).exclude(carry_forward_mode=CARRY_FORWARD_MANUAL))
+
+        created_total = 0
+        skipped_total = 0
+
+        for employee in active_employees:
+            for policy in policies:
+                if not _eligible_for_policy(employee, policy, today):
+                    continue
+
+                carry_forward = Decimal('0')
+                expiry_date   = None
+                if policy.can_carry_forward:
+                    prev = LeaveBalance.objects.filter(
+                        employee=employee, leave_type=policy.leave_type, year=prev_year,
+                    ).first()
+                    if prev:
+                        # Monthly no-carry types: record December's (and any other due)
+                        # expiry before carrying, so expiring credit is never carried.
+                        if is_monthly(policy) and not policy.monthly_carry_forward:
+                            sync_expiries(employee, policy, prev_year)
+                            prev.refresh_from_db()
+                        unused = unused_for_carry_forward(employee, policy, prev)
+                        if unused > 0:
+                            if policy.carry_forward_type == CARRY_FORWARD_UNLIMITED:
+                                carry_forward = unused
+                            elif policy.max_carry_forward_days > 0:
+                                carry_forward = min(unused, Decimal(str(policy.max_carry_forward_days)))
+
+                            if carry_forward > 0 and policy.carry_forward_expiry_days > 0:
+                                expiry_date = today + timedelta(days=policy.carry_forward_expiry_days)
+
+                _, created = LeaveBalance.objects.get_or_create(
+                    employee=employee,
+                    leave_type=policy.leave_type,
+                    year=new_year,
+                    defaults={
+                        'total_days':               annual_allocation(policy) + carry_forward,
+                        'carried_forward':          carry_forward,
+                        'carry_forward_expiry_date': expiry_date,
+                    },
+                )
+                if created:
+                    created_total += 1
+                else:
+                    skipped_total += 1
+
+        return {'year': new_year, 'created': created_total, 'skipped': skipped_total}
+
+    try:
+        result = run_for_all_tenants(
+            _run_for_one_tenant, task_name='reset_annual_leave_balances', required_module=MODULE_LEAVE,
+        )
+        logger.info('reset_annual_leave_balances completed: %s', result)
+        return result
+    except Exception as exc:
+        logger.error('reset_annual_leave_balances error: %s', exc, exc_info=True)
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=300)
+def send_birthday_wishes(self):
+    """
+    Daily task: for every active employee whose birthday (month + day)
+    matches today —
+      - send a birthday wish email (template 'birthday_wish', admin-editable
+        in Settings -> Email Templates)
+      - create an in-app Notification for the employee, their teammates
+        (same reporting manager), and their reporting manager
+      - record an AuditLog row (module='birthday') for delivery visibility
+        in Settings -> Audit Logs
+
+    Runs at 00:05 IST (configured in CELERY_BEAT_SCHEDULE), once per active
+    company (see apps.tenants.utils.run_for_all_tenants).
+    Gated by BirthdaySettings.is_enabled — the whole feature is a no-op
+    when disabled.
+    Idempotent — skips employees whose birthday_wish_sent_year already
+    equals the current year, so retries and duplicate runs are safe. That
+    same guard also prevents duplicate notifications/audit rows on retry.
+    """
+    from apps.tenants.utils import run_for_all_tenants
+
+    def _run_for_one_tenant():
+        from apps.accounts.models import BirthdaySettings, Company, EmployeeProfile
+        from apps.accounts.utils import send_template_email
+        from apps.hrms.birthday_utils import get_peers
+        from apps.notifications.signals import _notify
+
+        birthday_settings = BirthdaySettings.get()
+        if not birthday_settings.is_enabled:
+            logger.info('send_birthday_wishes skipped: feature disabled in BirthdaySettings.')
+            return {'skipped_reason': 'disabled'}
+
+        today        = timezone.localdate()
+        company      = Company.objects.first()
+        company_name = company.company_name if company else ''
+
+        profiles = (
+            EmployeeProfile.objects
+            .select_related('user')
+            .filter(
+                date_of_birth__isnull=False,
+                user__is_active=True,
+            )
+            .annotate(
+                birth_month=ExtractMonth('date_of_birth'),
+                birth_day=ExtractDay('date_of_birth'),
+            )
+            .filter(birth_month=today.month, birth_day=today.day)
+        )
+
+        sent_count    = 0
+        skipped_count = 0
+        failed_count  = 0
+
+        for profile in profiles:
+            if profile.birthday_wish_sent_year == today.year:
+                skipped_count += 1
+                continue
+
+            employee   = profile.user
+            email_addr = employee.email
+            name       = employee.full_name or employee.email
+
+            try:
+                send_template_email(
+                    recipient_email=email_addr,
+                    template_name='birthday_wish',
+                    context={
+                        'employee_name': name,
+                        'company_name':  company_name,
+                    },
+                )
+                profile.birthday_wish_sent_year = today.year
+                profile.save(update_fields=['birthday_wish_sent_year'])
+                sent_count += 1
+                logger.info('Birthday wish sent to %s (%s)', name, email_addr)
+                _record_birthday_delivery(employee, 'birthday_email_sent', {'email': email_addr})
+            except Exception as exc:
+                failed_count += 1
+                logger.exception('Failed to send birthday wish to %s (%s)', name, email_addr)
+                _record_birthday_delivery(
+                    employee, 'birthday_email_failed', {'email': email_addr, 'error': str(exc)},
+                )
+                continue
+
+            _notify(
+                employee, '🎉 Happy Birthday!',
+                birthday_settings.employee_notification_template,
+                'birthday', 'birthday', str(employee.id), employee,
+            )
+
+            for peer in get_peers(employee):
+                _notify(
+                    peer, '🎂 Team Birthday Today',
+                    birthday_settings.team_notification_template.format(employee_name=name),
+                    'birthday', 'birthday', str(employee.id),
+                )
+
+            if employee.reporting_manager_id:
+                _notify(
+                    employee.reporting_manager, '🎂 Team Birthday Today',
+                    birthday_settings.manager_notification_template.format(employee_name=name),
+                    'birthday', 'birthday', str(employee.id),
+                )
+
+        return {
+            'date':    today.isoformat(),
+            'sent':    sent_count,
+            'skipped': skipped_count,
+            'failed':  failed_count,
+        }
+
+    try:
+        result = run_for_all_tenants(_run_for_one_tenant, task_name='send_birthday_wishes')
+        logger.info('send_birthday_wishes completed: %s', result)
+        return result
+    except Exception as exc:
+        logger.error('send_birthday_wishes task error: %s', exc, exc_info=True)
+        raise self.retry(exc=exc)
+
+
+def _record_birthday_delivery(employee, action: str, changes: dict) -> None:
+    """Log a birthday email delivery attempt to the shared AuditLog table so
+    it surfaces in the existing System Admin -> Audit Logs page (?module=birthday)
+    without needing a dedicated log model/UI."""
+    try:
+        from apps.accounts.models import AuditLog
+        AuditLog.objects.create(
+            user=employee, action=action, module='birthday',
+            object_id=str(employee.id), changes=changes,
+        )
+    except Exception:
+        logger.exception('Failed to record birthday delivery audit log for %s', employee.id)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=300)
+def sync_monthly_leave_expiry(self):
+    """
+    Daily (00:20 IST), once per active company: for leave types on the Monthly
+    credit schedule with monthly carry-forward OFF, record the expiry of unused
+    monthly credit for every closed month of this year (and last year, so a
+    late December is caught after New Year), by difference — reruns and missed
+    days are idempotent catch-ups, and no ledger history is ever deleted.
+    Months before a policy's monthly_rules_from are never touched.
+    """
+    from apps.tenants.models import MODULE_LEAVE
+    from apps.tenants.utils import run_for_all_tenants
+
+    def _run_for_one_tenant():
+        from apps.hrms.models import CREDIT_SCHEDULE_MONTHLY, LeaveBalance, LeavePolicy
+        from apps.hrms.services_monthly_statement import sync_expiries
+
+        today = timezone.localdate()
+        policies = list(LeavePolicy.objects.filter(credit_schedule=CREDIT_SCHEDULE_MONTHLY, monthly_carry_forward=False))
+        changed = 0
+        for policy in policies:
+            balances = LeaveBalance.objects.filter(
+                leave_type=policy.leave_type, year__in=(today.year - 1, today.year),
+            ).select_related('employee')
+            for balance in balances:
+                try:
+                    if sync_expiries(balance.employee, policy, balance.year, today=today):
+                        changed += 1
+                except Exception:
+                    logger.exception('Monthly expiry sync failed for employee=%s leave_type=%s year=%s',
+                                     balance.employee_id, policy.leave_type, balance.year)
+        return {'balances_changed': changed}
+
+    try:
+        return run_for_all_tenants(
+            _run_for_one_tenant, task_name='sync_monthly_leave_expiry', required_module=MODULE_LEAVE,
+        )
+    except Exception as exc:
+        logger.exception('sync_monthly_leave_expiry failed: %s', exc)
+        raise self.retry(exc=exc)

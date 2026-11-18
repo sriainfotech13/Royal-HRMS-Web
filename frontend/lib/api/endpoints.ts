@@ -1,0 +1,565 @@
+export const API = {
+  companyPolicy: {
+    pendingAcknowledgements: "/documents/pending-acknowledgements/",
+    acknowledge:             (id: number) => `/documents/${id}/acknowledge/`,
+    acknowledgements:        (id: number) => `/documents/${id}/acknowledgements/`,
+    contacts:                "/company-contacts/",
+    contactDetail:           (id: number) => `/company-contacts/${id}/`,
+    contactApprovers:        (workflow: string) => `/company-contacts/approvers/?workflow=${encodeURIComponent(workflow)}`,
+  },
+
+  auth: {
+    login: "/login/",
+    logout: "/logout/",
+    forgotPassword: "/forgot-password/",
+    verifyOtp: "/verify-otp/",
+    resetPassword: "/reset-password/",
+    changePassword: "/change-password/",
+  },
+
+  platformAdmin: {
+    login: "/platform-admin/login/",
+    logout: "/platform-admin/logout/",
+    refresh: "/platform-admin/token/refresh/",
+    me: "/platform-admin/me/",
+    forgotPassword: "/platform-admin/forgot-password/",
+    verifyOtp: "/platform-admin/verify-otp/",
+    resetPassword: "/platform-admin/reset-password/",
+    changePassword: "/platform-admin/change-password/",
+    companies: {
+      list: "/platform-admin/companies/",
+      detail: (id: string) => `/platform-admin/companies/${id}/`,
+      revealPassword: (id: string) => `/platform-admin/companies/${id}/reveal-password/`,
+      systemAdmin:    (id: string) => `/platform-admin/companies/${id}/system-admin/`,
+      systemAdminResetPassword: (id: string) => `/platform-admin/companies/${id}/system-admin/reset-password/`,
+      retryProvisioning: (id: string) => `/platform-admin/companies/${id}/retry-provisioning/`,
+    },
+    saas: {
+      dashboard: "/platform-admin/saas/dashboard/",
+      features: "/platform-admin/saas/features/",
+      plans: "/platform-admin/saas/plans/",
+      plan: (id: string) => `/platform-admin/saas/plans/${id}/`,
+      subscriptions: "/platform-admin/saas/subscriptions/",
+      subscription: (clientId: string) => `/platform-admin/saas/subscriptions/${clientId}/`,
+      changePlan: (clientId: string) => `/platform-admin/saas/subscriptions/${clientId}/change-plan/`,
+      period: (clientId: string) => `/platform-admin/saas/subscriptions/${clientId}/period/`,
+      edit: (clientId: string) => `/platform-admin/saas/subscriptions/${clientId}/edit/`,
+      status: (clientId: string) => `/platform-admin/saas/subscriptions/${clientId}/status/`,
+      payments: (clientId: string) => `/platform-admin/saas/subscriptions/${clientId}/payments/`,
+      verifyPayment: (clientId: string, id: string) => `/platform-admin/saas/subscriptions/${clientId}/payments/${id}/verify/`,
+      rejectPayment: (clientId: string, id: string) => `/platform-admin/saas/subscriptions/${clientId}/payments/${id}/reject/`,
+      paymentReceipt: (clientId: string, id: string) => `/platform-admin/saas/subscriptions/${clientId}/payments/${id}/receipt/`,
+      amountDue: (clientId: string) => `/platform-admin/saas/subscriptions/${clientId}/amount-due/`,
+      waiver: (clientId: string) => `/platform-admin/saas/subscriptions/${clientId}/waiver/`,
+      provision: (clientId: string) => `/platform-admin/saas/subscriptions/${clientId}/provision/`,
+      history: "/platform-admin/saas/history/",
+      registrations: "/platform-admin/saas/registrations/",
+      registration: (id: string) => `/platform-admin/saas/registrations/${id}/`,
+      approveRegistration: (id: string) => `/platform-admin/saas/registrations/${id}/approve/`,
+      rejectRegistration: (id: string) => `/platform-admin/saas/registrations/${id}/reject/`,
+    },
+    notifications: "/platform-admin/notifications/",
+    notificationsRead: "/platform-admin/notifications/read/",
+    admins: {
+      list: "/platform-admin/admins/",
+      detail: (id: string) => `/platform-admin/admins/${id}/`,
+    },
+    auditLogs: "/platform-admin/audit-logs/",
+    dashboardStats: "/platform-admin/dashboard-stats/",
+    smtpSettings: "/platform-admin/smtp-settings/",
+    smtpSettingsTest: "/platform-admin/smtp-settings/test/",
+  },
+
+  announcements: {
+    list: "/announcements/",
+    detail: (id: string | number) => `/announcements/${id}/`,
+    view: (id: string | number) => `/announcements/${id}/view/`,
+    react: (id: string | number) => `/announcements/${id}/react/`,
+  },
+
+  branches: {
+    list: "/branch/branches/",
+    stats: "/branch/branches/stats/",
+    distribution: "/branch/branches/distribution/",
+    previewCode: "/branch/branches/preview-code/",
+    detail: (id: string | number) => `/branch/branches/${id}/`,
+    reassignAdmin: (id: string | number) => `/branch/branches/${id}/reassign-admin/`,
+    states: "/branch/states/",
+    cities: (stateId: string | number) => `/branch/states/${stateId}/cities/`,
+  },
+
+  departments: {
+    list: "/departments/",
+    detail: (id: string | number) => `/departments/${id}/`,
+  },
+
+  designations: {
+    list: "/designations/",
+    detail: (id: string | number) => `/designations/${id}/`,
+  },
+
+  assets: {
+    list: "/assets/",
+    detail: (id: string) => `/assets/${id}/`,
+    employeeAssets: (employeeId: string) => `/assets/employees/${employeeId}/`,
+    assign: (employeeId: string) => `/assets/employees/${employeeId}/assign/`,
+    return: (assignmentId: string) => `/assets/assignments/${assignmentId}/return/`,
+    sendToMaintenance: (id: string) => `/assets/${id}/send-to-maintenance/`,
+    completeMaintenance: (recordId: string) => `/assets/maintenance/${recordId}/complete/`,
+    import:       "/assets/import/",
+    importSample: "/assets/import/sample/",   // + ?format=csv|xlsx
+    assignImport:       "/assets/assignments/import/",
+    assignImportSample: "/assets/assignments/import/sample/",   // + ?format=csv|xlsx
+    categories: {
+      list: "/assets/categories/",
+      detail: (id: number | string) => `/assets/categories/${id}/`,
+    },
+    types: {
+      list: (categoryId?: number | string) =>
+        categoryId ? `/assets/types/?category=${categoryId}` : "/assets/types/",
+      detail: (id: number | string) => `/assets/types/${id}/`,
+    },
+  },
+
+  orgChart: {
+    get: (branch?: string) => branch ? `/org-chart/?branch=${encodeURIComponent(branch)}` : "/org-chart/",
+  },
+
+  employees: {
+    list: "/employees/",
+    stats: "/employees/stats/",
+    hrList: "/employees/hrs/",
+    managerList: "/employees/managers/",
+    me: "/employees/me/",
+    myPhoto: "/employees/me/photo/",
+    detail: (id: string) => `/employees/${id}/`,
+    promotions: (id: string) => `/employees/${id}/promotions/`,
+    profile: (id: string) => `/employees/${id}/profile/`,
+    reportingManager: (id: string) => `/employees/${id}/reporting-manager/`,
+    hr: (id: string) => `/employees/${id}/hr/`,
+    approvalMatrix: (id: string) => `/employees/${id}/approval-matrix/`,
+    documents: (id: string) => `/employees/${id}/documents/`,
+    customFileFields: (id: string) => `/employees/${id}/custom-file-fields/`,
+    resetPassword: (id: string) => `/employees/${id}/reset-password/`,
+    idCard: (id: string) => `/employees/${id}/id-card/`,
+    branches:    "/branch/branches/",
+    bulkImport:  "/employees/bulk-import/",
+    bulkImportSample: "/employees/bulk-import/sample/",
+    noticePeriodImport:       "/employees/notice-period/import/",
+    noticePeriodImportSample: "/employees/notice-period/import/sample/",
+  },
+
+  roles: {
+    list: "/roles/",
+    detail: (id: string | number) => `/roles/${id}/`,
+  },
+
+  permissions: {
+    list: "/permissions/",
+  },
+
+  settings: {
+    audit: "/settings/audit/",
+    company: "/settings/company/",
+    financialYear: "/settings/company/financial-year/",
+    companyPlan: "/settings/company/plan/",
+    employeeCode: "/settings/employee-code/",
+    idCard: "/settings/id-card/",
+    idCardReferencePdf: "/settings/id-card/reference-pdf/",
+    emailTemplates: "/settings/email-templates/",
+    resolveTemplateContext: "/settings/email-templates/resolve-context/",
+    approvalRules: "/settings/approval-rules/",
+    assessmentConfig: "/assessments/settings/",
+    onboardingFields: {
+      list: "/settings/onboarding-fields/",
+      detail: (fieldKey: string) => `/settings/onboarding-fields/${fieldKey}/`,
+    },
+    documentTypes: {
+      list: "/settings/document-types/",
+      detail: (typeKey: string) => `/settings/document-types/${typeKey}/`,
+    },
+  },
+
+  hrms: {
+    birthdays: "/birthdays/",
+    birthdaySettings: "/birthdays/settings/",
+  },
+
+  referrals: {
+    list: "/recruitment/referrals/",
+    all: "/recruitment/referrals/all/",
+    create: "/recruitment/referrals/",
+  },
+
+  referralRules: {
+    list: "/recruitment/referral-rules/",
+    create: "/recruitment/referral-rules/",
+    detail: (id: number) => `/recruitment/referral-rules/${id}/`,
+  },
+
+  recruitment: {
+    candidates: "/recruitment/candidates/",
+    bulkImport: "/recruitment/candidates/bulk-import/",
+    bulkImportSample: "/recruitment/candidates/bulk-import/sample/",
+    stats: "/recruitment/candidates/stats/",
+    review: "/recruitment/candidates/review/",
+    detail: (id: number) => `/recruitment/candidates/${id}/`,
+    status: "/recruitment/candidates/status-choices/",
+    candidateStatus: (id: number) => `/recruitment/candidates/${id}/status/`,
+    hrDecision: (id: number) => `/recruitment/candidates/${id}/hr-decision/`,
+    sendPortalLogin: (id: number) => `/recruitment/candidates/${id}/send-portal-login/`,
+    sendEmail: (id: number | string) => `/recruitment/candidates/${id}/send-email/`,
+    emailLogs: "/recruitment/emails/",
+  },
+
+  onboarding: {
+    profile: "/onboarding/",
+    profileStep: (step: number) => `/onboarding/step/${step}/`,
+    fieldConfig: "/onboarding/field-config/",
+    documentTypeConfig: "/onboarding/document-type-config/",
+    documents: "/onboarding/documents/",
+    documentDetail: (docId: string) => `/onboarding/documents/${docId}/`,
+    customFileFields: "/onboarding/custom-file-fields/",
+    customFileFieldDetail: (valueId: number | string) => `/onboarding/custom-file-fields/${valueId}/`,
+    submit: "/onboarding/",
+    approvals: "/onboarding/approvals/",
+    pipeline: "/onboarding/approvals/?view=pipeline",
+    approve: (userId: string) => `/onboarding/approvals/${userId}/`,
+  },
+
+  approvals: {
+    leaveRequests: "/leave/requests/",
+    approveLeave: (id: string) => `/leave/requests/${id}/approve/`,
+    wfhRequests: "/wfh/requests/",
+    approveWfh: (id: string) => `/wfh/requests/${id}/approve/`,
+    expenseList: "/expenses/",
+    approveExpense: (id: string) => `/expenses/${id}/approve/`,
+    escalationSettings:       "/approvals/escalation-settings/",
+    escalationHeadCandidates: "/approvals/escalation-settings/head-candidates/",
+    escalations:              "/approvals/escalations/",
+    delegations:              "/approvals/delegations/",
+    delegationsEligible:      "/approvals/delegations/eligible/", // + ?workflow=leave|attendance
+    delegationRevoke:         (id: string) => `/approvals/delegations/${id}/revoke/`,
+  },
+
+  expenses: {
+    list: "/expenses/",
+    stats: "/expenses/stats/",
+    categories: "/expenses/categories/",
+    updateStatus: "/expenses/status/",
+    detail: (id: string) => `/expenses/${id}/`,
+    approve: (id: string) => `/expenses/${id}/approve/`,
+  },
+
+  separation: {
+    list:            "/separation/requests/",
+    detail:          (id: string) => `/separation/requests/${id}/`,
+    stageAction:     (id: string, stageId: string) => `/separation/requests/${id}/stages/${stageId}/action/`,
+    tasks:           (id: string) => `/separation/requests/${id}/tasks/`,
+    taskDetail:      (id: string, taskId: string) => `/separation/requests/${id}/tasks/${taskId}/`,
+    clearances:      (id: string) => `/separation/requests/${id}/clearances/`,
+    clearanceAction: (id: string, clearanceId: string) => `/separation/requests/${id}/clearances/${clearanceId}/action/`,
+    documents:       (id: string) => `/separation/requests/${id}/documents/`,
+    documentDetail:  (id: string, documentId: string) => `/separation/requests/${id}/documents/${documentId}/`,
+    activities:      (id: string) => `/separation/requests/${id}/activities/`,
+    types:           "/separation/types/",
+    reasons:         "/separation/reasons/",
+  },
+
+  assessments: {
+    // Candidate portal
+    my: "/assessments/my/",
+    respond: (assignmentId: string, itemId: string) => `/assessments/${assignmentId}/respond/${itemId}/`,
+    complete: (assignmentId: string) => `/assessments/${assignmentId}/complete/`,
+    retake: (assignmentId: string) => `/assessments/${assignmentId}/retry/`,
+    // HR management
+    list: "/assessments/",
+    detail: (id: string) => `/assessments/${id}/`,
+    items: (assessmentId: string) => `/assessments/${assessmentId}/items/`,
+    itemDetail: (itemId: string) => `/assessments/items/${itemId}/`,
+    sections: (assessmentId: string) => `/assessments/${assessmentId}/sections/`,
+    sectionDetail: (assessmentId: string, sectionId: string) => `/assessments/${assessmentId}/sections/${sectionId}/`,
+    assign: "/assessments/assign/",
+    emailTemplateOptions: "/assessments/email-template-options/",
+    results: (assessmentId: string) => `/assessments/${assessmentId}/results/`,
+    candidateResults: (candidateId: string) => `/assessments/candidates/${candidateId}/results/`,
+  },
+
+  leave: {
+    policy: "/leave/policy/",
+    policyDetail: (leaveType: string) => `/leave/policy/${leaveType}/`,
+    balance: "/leave/balance/",
+    balanceCredit: "/leave/balance/credit/",
+    balanceAdjust: (id: string) => `/leave/balance/${id}/`,
+    balanceImportSample:   "/leave/balance/import/sample/", // + ?format=csv|xlsx
+    balanceImport:         "/leave/balance/import/",
+    balanceImportValidate: "/leave/balance/import/validate/",
+    creditsOverview: (employeeCode: string) => `/leave/credits/${employeeCode}/`,
+    monthlyCredits:       "/leave/monthly-credits/",
+    monthlyCreditsImport: "/leave/monthly-credits/import/",
+    monthlyCreditsSample: "/leave/monthly-credits/import/sample/", // + ?format=csv|xlsx
+    monthlyAssignments:   "/leave/monthly-credits/assignments/",
+    monthlyCreditsBulk:   "/leave/monthly-credits/bulk/",
+    creditsAdjust:   (employeeCode: string) => `/leave/credits/${employeeCode}/adjust/`,
+    creditsReverse:  (employeeCode: string, txnId: string) => `/leave/credits/${employeeCode}/transactions/${txnId}/reverse/`,
+    requests: "/leave/requests/",
+    requestDetail: (id: string) => `/leave/requests/${id}/`,
+    approve: (id: string) => `/leave/requests/${id}/approve/`,
+    cancellationRequest:  (id: string) => `/leave/requests/${id}/cancellation/`,
+    cancellationDecision: (id: string) => `/leave/requests/${id}/cancellation/decision/`,
+    cancellations:        "/leave/cancellations/",
+    stats: "/leave/stats/",
+    calendar: "/leave/calendar/",
+    holidays: "/leave/holidays/",
+    holidayDetail: (id: string) => `/leave/holidays/${id}/`,
+    carryForward: {
+      years:   "/leave/carry-forward/years/",
+      preview: "/leave/carry-forward/preview/",
+      run:     "/leave/carry-forward/run/",
+      history: "/leave/carry-forward/history/",
+    },
+  },
+
+  training: {
+    courses:          "/training/courses/",
+    course:           (id: string) => `/training/courses/${id}/`,
+    thumbnail:        (id: string) => `/training/courses/${id}/thumbnail/`,
+    thumbnailFile:    (id: string) => `/training/courses/${id}/thumbnail/file/`,
+    materials:        (id: string) => `/training/courses/${id}/materials/`,
+    reorder:          (id: string) => `/training/courses/${id}/materials/reorder/`,
+    assign:           (id: string) => `/training/courses/${id}/assign/`,
+    progress:         (id: string) => `/training/courses/${id}/progress/`,
+    material:         (id: string) => `/training/materials/${id}/`,
+    materialFile:     (id: string) => `/training/materials/${id}/file/`,
+    videoSource:      (id: string) => `/training/materials/${id}/video-source/`,
+    assignment:       (id: string) => `/training/assignments/${id}/`,
+    resetAssessment:  (id: string) => `/training/assignments/${id}/reset-assessment/`,
+    assessments:      "/training/assessments/",
+    employees:        "/training/employees/",
+    dashboard:        "/training/dashboard/",
+    reports:          "/training/reports/",
+    my:               "/training/my/",
+    myDetail:         (id: string) => `/training/my/${id}/`,
+    myMaterial:       (id: string, materialId: string, action: "open" | "progress" | "confirm") =>
+                        `/training/my/${id}/materials/${materialId}/${action}/`,
+    myAssessment:     (id: string, action: "start" | "submit") => `/training/my/${id}/assessment/${action}/`,
+  },
+
+  workFromHome: {
+    requests:            "/wfh/requests/",
+    requestDetail:       (id: string) => `/wfh/requests/${id}/`,
+    approve:             (id: string) => `/wfh/requests/${id}/approve/`,
+    savedLocations:      "/wfh/saved-locations/",
+    savedLocationDetail: (id: string) => `/wfh/saved-locations/${id}/`,
+    reports:             "/wfh/reports/",
+    reportReview:        (id: number) => `/wfh/reports/${id}/review/`,
+  },
+
+  attendance: {
+    settings: "/attendance/settings/",
+    punch: "/attendance/punch/",
+    geofenceCheck: "/attendance/geofence-check/",
+    today: "/attendance/today/",
+    stats: "/attendance/stats/",
+    summary: "/attendance/summary/",
+    calendar: "/attendance/calendar/",
+    correction: "/attendance/correction/",
+    geofencing: (branchPk: number) => `/branch/branches/${branchPk}/geofencing/`,
+
+    // HR Management
+    dashboard: "/attendance/dashboard/",
+    records: "/attendance/records/",
+    recordCreate: "/attendance/records/create/",
+    record: (id: string) => `/attendance/records/${id}/`,
+    overtime: "/attendance/overtime/",
+    overtimeCreate: "/attendance/overtime/create/",
+    invalidPunches: "/attendance/invalid-punches/",
+    invalidPunchAssign: (id: string) => `/attendance/invalid-punches/${id}/assign/`,
+    invalidPunchDiscard: (id: string) => `/attendance/invalid-punches/${id}/discard/`,
+    invalidPunchConvert: (id: string) => `/attendance/invalid-punches/${id}/convert/`,
+    recordAudit: (id: string) => `/attendance/records/${id}/audit/`,
+    unPunches: "/attendance/un-punches/",
+    import: "/attendance/import/",
+    importSample: "/attendance/import/sample/",
+    export: "/attendance/export/",
+    corrections: "/attendance/corrections/",
+    correctionReview: (id: string) => `/attendance/corrections/${id}/review/`,
+    myCorrections: "/attendance/corrections/my/",
+    // Late-arrival justification (an AttendanceCorrection of kind "late_justification").
+    lateJustification: "/attendance/late-justification/",
+    // Maximum Late Arrivals Per Month (tracking only) and who is over it.
+    lateArrivalLimit: "/attendance/late-arrival-limit/",
+    lateArrivalLimitEmployees: "/attendance/late-arrival-limit/employees/",
+    lateJustificationResubmit: (id: string) => `/attendance/late-justification/${id}/resubmit/`,
+    // Proof file, streamed only to the uploader and users with medical-proof access.
+    correctionDocument: (id: string) => `/attendance/corrections/${id}/document/`,
+    employeeCalendar: (employeeId: string, month: string) => `/attendance/employee-calendar/?employee_id=${employeeId}&month=${month}`,
+
+    faceCaptureTelemetry: "/attendance/face-capture-telemetry/",
+
+    faceRegistration: {
+      submit:  "/attendance/face-registration/",
+      me:      "/attendance/face-registration/me/",
+      pending: "/attendance/face-registration/pending/",
+      review:  (id: string) => `/attendance/face-registration/${id}/review/`,
+
+      // HR-initiated registration (register/update on someone's behalf, in person)
+      register: "/attendance/face-registration/register/",
+      employees: (search?: string) =>
+        `/attendance/face-registration/employees/${search ? `?search=${encodeURIComponent(search)}` : ""}`,
+      employeeStatus: (employeeUuid: string) => `/attendance/face-registration/employees/${employeeUuid}/status/`,
+    },
+
+    // Org-wide toggle (Attendance Settings -> Face ID Verification) — whether
+    // face ID registration is mandatory and enforced at web clock-in/out.
+    faceVerification: {
+      status: "/attendance/face-verification/status/",
+    },
+
+    // Weekly Off Patterns (Settings) — existing backend CRUD, newly exposed to the frontend
+    weeklyDayPolicies: "/attendance/weekly-days/",
+    weeklyDayPolicy: (id: string) => `/attendance/weekly-days/${id}/`,
+
+    // Weekly Off Assignment (Attendance & Time tab)
+    weeklyOffAssignments: "/attendance/weekly-off-assignments/",
+    weeklyOffAssignmentsBulk: "/attendance/weekly-off-assignments/bulk/",
+    weeklyOffAssignmentHistory: (employeeId: string) => `/attendance/weekly-off-assignments/${employeeId}/history/`,
+
+    // Working Hours / Shift Policies (Settings) — existing backend CRUD, newly exposed to the frontend
+    workingHoursPolicies: "/attendance/working-hours/",
+    workingHoursPolicy: (id: string) => `/attendance/working-hours/${id}/`,
+
+    // Shift Assignment (Attendance & Time tab) — mirrors Weekly Off Assignment above
+    shiftAssignments: "/attendance/shift-assignments/",
+    shiftAssignmentsBulk: "/attendance/shift-assignments/bulk/",
+    shiftAssignmentHistory: (employeeId: string) => `/attendance/shift-assignments/${employeeId}/history/`,
+  },
+
+  voice: {
+    parse: "/voice/parse/",
+    transcribeFallback: "/voice/transcribe-fallback/",
+    speak: "/voice/speak/",
+  },
+
+  notifications: {
+    list: "/notifications/",
+    unreadCount: "/notifications/unread-count/",
+    markRead: (id: string) => `/notifications/${id}/read/`,
+    markAllRead: "/notifications/read-all/",
+    settings: "/notifications/settings/",
+  },
+
+  employeeDashboard: {
+    kpis:              "/dashboard/employee/kpis/",
+    leaveBalances:     "/dashboard/employee/leave-balances/",
+    actionItems:       "/dashboard/employee/action-items/",
+    recentRequests:    "/dashboard/employee/recent-requests/",
+    attendanceSummary: "/dashboard/employee/attendance-summary/",
+    attendanceStatus:  "/dashboard/employee/attendance-status/",
+    announcement:      "/dashboard/announcement/",
+    birthdaysToday:    "/dashboard/employee/birthdays/today/",
+    myBirthdayWidgets: "/dashboard/birthdays/mine/",
+    noticePeriod:      "/dashboard/employee/notice-period/",
+  },
+
+  payroll: {
+    // Settings
+    settings: "/payroll/settings/",
+    settingsStamp: "/payroll/settings/stamp/",
+
+    // Salary structures
+    structures: "/payroll/structures/",
+    structure: (id: string) => `/payroll/structures/${id}/`,
+    structureImport: "/payroll/structures/import/",
+    structureImportSample: "/payroll/structures/import/sample/",
+    structureAssignImport: "/payroll/structures/assign-import/",
+    structureAssignSample: "/payroll/structures/assign-import/sample/",
+    salaryImport: "/payroll/salary-import/",
+    salaryImportSample: "/payroll/salary-import/sample/",
+    components: (structureId: string) => `/payroll/structures/${structureId}/components/`,
+    component: (structureId: string, id: string) => `/payroll/structures/${structureId}/components/${id}/`,
+
+    // Statutory config (per state)
+    statutory: "/payroll/statutory/",
+    statutoryDetail: (id: string) => `/payroll/statutory/${id}/`,
+    statutoryByState: (stateId: string) => `/payroll/statutory/by-state/${stateId}/`,
+
+    // Branch payroll config
+    branchConfig: "/payroll/branch-config/",
+    branchConfigDetail: (id: string) => `/payroll/branch-config/${id}/`,
+    branchConfigByBranch: (branchId: string) => `/payroll/branch-config/by-branch/${branchId}/`,
+
+    // Employee salary config (CTC)
+    employeeSalary: "/payroll/employee-salary/",
+    employeeSalaryDetail: (id: string) => `/payroll/employee-salary/${id}/`,
+    employeeSalaryHistory: (employeeId: string) => `/payroll/employee-salary/history/${employeeId}/`,
+    employeePayslipHistory: (employeeId: string) => `/payroll/employees/${employeeId}/payslips/`,
+
+    // Payroll cycles
+    cycles: "/payroll/cycles/",
+    cycle: (id: string) => `/payroll/cycles/${id}/`,
+    approveAttendance:   (id: string) => `/payroll/cycles/${id}/approve-attendance/`,
+    managerApprovals:    (id: string) => `/payroll/cycles/${id}/manager-approvals/`,
+    pendingApprovalCycles: "/payroll/cycles/pending-approval/",
+    attendanceSummary:   (id: string) => `/payroll/cycles/${id}/attendance-summary/`,
+    employeeDailyAttendance: (cycleId: string, employeeId: string) => `/payroll/cycles/${cycleId}/attendance-daily/${employeeId}/`,
+    processCycle: (id: string) => `/payroll/cycles/${id}/process/`,
+    eligibleEmployees: (id: string) => `/payroll/cycles/${id}/eligible-employees/`,
+    markPaid: (id: string) => `/payroll/cycles/${id}/mark-paid/`,
+    salaryTransferStatus:  (id: string) => `/payroll/cycles/${id}/salary-transfer/status/`,
+    confirmSalaryTransfer: (id: string) => `/payroll/cycles/${id}/salary-transfer/confirm/`,
+    cancelCycle: (id: string) => `/payroll/cycles/${id}/cancel/`,
+    cycleEcr:     (id: string) => `/payroll/cycles/${id}/ecr/`,
+    cycleEcrPdf:  (id: string) => `/payroll/cycles/${id}/ecr/pdf/`,
+    cycleEcrText: (id: string) => `/payroll/cycles/${id}/ecr-text/`,
+    cycleEsic:    (id: string) => `/payroll/cycles/${id}/esic/`,
+
+    // Payslips (HR)
+    cyclePayslips: (cycleId: string) => `/payroll/cycles/${cycleId}/payslips/`,
+    dispatchPayslips: (cycleId: string) => `/payroll/cycles/${cycleId}/payslips/dispatch/`,
+    expenseSummary: (cycleId: string) => `/payroll/cycles/${cycleId}/expense-summary/`,
+    referralBonusSummary: (cycleId: string) => `/payroll/cycles/${cycleId}/referral-bonus-summary/`,
+    payslip: (id: string) => `/payroll/payslips/${id}/`,
+    payslipReimbBonus: (id: string) => `/payroll/payslips/${id}/reimb-bonus/`,
+
+    // Employee self-service
+    myPayslips: "/payroll/my-payslips/",
+    acknowledgePayslip: (id: string) => `/payroll/my-payslips/${id}/acknowledge/`,
+
+    // Queries
+    queries: "/payroll/queries/",
+    resolveQuery: (id: string) => `/payroll/queries/${id}/resolve/`,
+
+    // Adjustments
+    adjustments: "/payroll/adjustments/",
+    adjustmentDetail: (id: string) => `/payroll/adjustments/${id}/`,
+    adjustmentsBulkImport: "/payroll/adjustments/bulk-import/",
+    adjustmentsImportSample: "/payroll/adjustments/bulk-import/sample/",
+
+    // Branch payroll status overview (admin only)
+    branchStatus: "/payroll/branch-status/",
+  },
+
+  dashboard: {
+    // System Admin
+    kpis:                "/dashboard/system-admin/kpis/",
+    announcement:        "/dashboard/system-admin/announcement/",
+    pendingApprovals:    "/dashboard/system-admin/pending-approvals/",
+    departmentHeadcount: "/dashboard/system-admin/department-headcount/",
+    employeeLifecycle:   "/dashboard/system-admin/employee-lifecycle/",
+    birthdaysToday:      "/dashboard/system-admin/birthdays/today/",
+    birthdaysUpcoming:   "/dashboard/system-admin/birthdays/upcoming/",
+    auditLogs:           "/dashboard/system-admin/audit-logs/",
+    // HR
+    hrKpis:                "/dashboard/hr/kpis/",
+    hrActionQueue:         "/dashboard/hr/action-queue/",
+    hrRecruitmentFunnel:   "/dashboard/hr/recruitment-funnel/",
+    hrAttendanceSummary:   "/dashboard/hr/attendance-summary/",
+    hrDepartmentHeadcount: "/dashboard/department-headcount/",
+    hrEmployeeLifecycle:   "/dashboard/hr/employee-lifecycle/",
+    hrBirthdaysToday:      "/dashboard/hr/birthdays/today/",
+    hrBirthdaysUpcoming:   "/dashboard/hr/birthdays/upcoming/",
+    // Manager / Team Lead dashboard
+    manager:               "/dashboard/manager/",
+  },
+} as const;
